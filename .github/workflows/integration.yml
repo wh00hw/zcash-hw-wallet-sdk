@@ -1,0 +1,37 @@
+name: Integration Tests
+
+on: [push, pull_request]
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc cmake make pkg-config libsqlite3-dev libudev-dev
+
+      - name: Build virtual device
+        run: |
+          cd integration-tests/virtual-device
+          cmake -B build -DLIBZCASH_SOURCE_DIR=${{ github.workspace }}/libzcash-orchard-c
+          cmake --build build -j$(nproc)
+
+      - name: Start virtual device
+        run: |
+          ./integration-tests/virtual-device/build/virtual-device --port 9999 &
+          sleep 2
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Run integration tests
+        run: cargo test --test integration --features tcp -- --test-threads=1
+        env:
+          VIRTUAL_DEVICE_ADDR: "127.0.0.1:9999"

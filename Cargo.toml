@@ -1,0 +1,67 @@
+[package]
+name = "zcash-hw-wallet-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Transport-agnostic SDK for signing Zcash Orchard shielded transactions via hardware wallets using the PCZT standard"
+repository = "https://github.com/wh00hw/zcash-hw-wallet-sdk"
+keywords = ["zcash", "hardware-wallet", "pczt", "orchard", "signing"]
+categories = ["cryptography", "hardware-support"]
+
+[features]
+default = ["serial"]
+serial = ["dep:serialport"]
+ledger = ["dep:hidapi"]
+tcp = []
+qr = ["dep:qrcode", "dep:image", "dep:rqrr", "dep:ur"]
+
+[dependencies]
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Serialization & encoding
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+
+# Security hardening
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+blake2b_simd = "1"
+
+# Zcash crates — aligned with librustzcash main
+pczt = { version = "0.5", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
+orchard = "0.12"
+reddsa = "0.5"
+ff = "0.13"
+zcash_address = "0.10"
+zcash_primitives = "0.26"
+zcash_protocol = "0.7"
+
+# Serial transport (optional)
+serialport = { version = "4", optional = true }
+
+# Ledger HID transport (optional)
+hidapi = { version = "2", optional = true }
+
+# QR transport (optional)
+qrcode = { version = "0.14", optional = true }
+image = { version = "0.25", optional = true }
+rqrr = { version = "0.8", optional = true }
+ur = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+blake2b_simd = "1"
+
+[patch.crates-io]
+pczt = { path = "librustzcash/pczt" }
+orchard = { package = "orchard", git = "https://github.com/zcash/orchard.git", rev = "6b12c77260aa7fac0d804983fc31b71b584d48e0" }
+sapling-crypto = { git = "https://github.com/zcash/sapling-crypto.git", rev = "e99f38a8f4685c381bb4cca94874092e50e3f7e9" }
+zcash_primitives = { path = "librustzcash/zcash_primitives" }
+zcash_protocol = { path = "librustzcash/components/zcash_protocol" }
+zcash_address = { path = "librustzcash/components/zcash_address" }

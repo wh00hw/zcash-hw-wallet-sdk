@@ -1,0 +1,6 @@
+[submodule "libzcash-orchard-c"]
+	path = libzcash-orchard-c
+	url = https://github.com/wh00hw/libzcash-orchard-c.git
+[submodule "librustzcash"]
+	path = librustzcash
+	url = https://github.com/zcash/librustzcash.git

@@ -1,0 +1,5 @@
+/target
+.claude/
+
+# CMake build artifacts (virtual device)
+integration-tests/**/build/

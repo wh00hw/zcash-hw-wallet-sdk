@@ -1,0 +1,316 @@
+//! PCZT hardware signing workflow manager.
+//!
+//! Orchestrates the full signing pipeline:
+//! 1. Generate Orchard proof (Halo2)
+//! 2. Compute sighash
+//! 3. Send action data to device for sighash verification (v2)
+//! 4. Collect signatures from hardware device
+//! 5. Verify each signature
+//! 6. Inject signatures into PCZT
+//! 7. Return signed PCZT for extraction
+
+use crate::error::{HwSignerError, Result};
+use crate::traits::HardwareSigner;
+use crate::types::{coin_type_for_network, ActionData, SignRequest, SigningResult, TxDetails, TxMeta};
+use crate::verify;
+
+use ff::PrimeField;
+use tracing::{debug, info};
+use zcash_protocol::consensus::{BranchId, Network};
+use zeroize::Zeroize;
+
+/// High-level PCZT hardware signing workflow.
+///
+/// Takes a PCZT that has been created from a proposal (using the full viewing
+/// key only — no spending key), runs the Orchard prover, sends each action
+/// to the hardware signer for signature, verifies the signatures, and
+/// returns the fully signed PCZT.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use zcash_hw_wallet_sdk::{PcztHardwareSigning, DeviceSigner};
+/// use zcash_hw_wallet_sdk::transport::SerialTransport;
+/// use zcash_protocol::consensus::Network;
+///
+/// // Create the signer connected to a hardware device
+/// let transport = SerialTransport::new("/dev/ttyACM0", 115200)?;
+/// let signer = DeviceSigner::new(transport)?;
+///
+/// // Sign a PCZT (obtained from zcash_client_backend::create_pczt_from_proposal)
+/// let mut workflow = PcztHardwareSigning::new(signer, Network::TestNetwork);
+/// let result = workflow.sign(pczt_bytes)?;
+///
+/// // result.signed_pczt can be passed to extract_and_store_transaction_from_pczt
+/// ```
+pub struct PcztHardwareSigning<S: HardwareSigner> {
+    signer: S,
+    network: Network,
+}
+
+impl<S: HardwareSigner> PcztHardwareSigning<S> {
+    /// Create a new workflow manager wrapping a hardware signer.
+    ///
+    /// The `network` parameter determines:
+    /// - The `coin_type` sent to the device in TxMeta (133 mainnet, 1 testnet)
+    /// - Pre-proof validation that the PCZT's consensus_branch_id is Orchard-capable
+    pub fn new(signer: S, network: Network) -> Self {
+        Self { signer, network }
+    }
+
+    /// Get a reference to the underlying signer.
+    pub fn signer(&self) -> &S {
+        &self.signer
+    }
+
+    /// Get a mutable reference to the underlying signer.
+    pub fn signer_mut(&mut self) -> &mut S {
+        &mut self.signer
+    }
+
+    /// Consume the workflow and return the underlying signer.
+    pub fn into_signer(self) -> S {
+        self.signer
+    }
+
+    /// Sign a PCZT using the hardware wallet.
+    ///
+    /// The input `pczt_bytes` must be a serialized PCZT that has been created
+    /// from a proposal (via `create_pczt_from_proposal`). The PCZT must contain
+    /// Orchard actions — Sapling-only transactions are not yet supported.
+    ///
+    /// Returns a [`SigningResult`] containing the fully signed PCZT bytes
+    /// and metadata about the signing process.
+    pub fn sign(&mut self, pczt_bytes: Vec<u8>) -> Result<SigningResult> {
+        self.sign_with_details(pczt_bytes, None)
+    }
+
+    /// Sign a PCZT with optional transaction details for device confirmation.
+    ///
+    /// If `details` is provided, the device's `confirm_transaction` method
+    /// is called before signing begins. This allows the user to verify
+    /// the transaction on the device screen.
+    pub fn sign_with_details(
+        &mut self,
+        pczt_bytes: Vec<u8>,
+        details: Option<TxDetails>,
+    ) -> Result<SigningResult> {
+        // Step 1: Extract tx metadata for device verification
+        // Extract TxMeta from the actual TransactionData (not from PCZT Global)
+        // to ensure fields like lock_time match what zcash_primitives uses.
+        let tx_meta = {
+            use zcash_primitives::transaction::txid::TxIdDigester;
+
+            let pczt_clone = pczt::Pczt::parse(&pczt_bytes).unwrap();
+            let tx_data = pczt_clone.into_effects()
+                .expect("PCZT effects extraction failed");
+            let txid_parts = tx_data.digest(TxIdDigester);
+
+            // transparent_sig_digest from txid parts
+            let transparent_sig_digest = {
+                let mut h = blake2b_simd::Params::new()
+                    .hash_length(32).personal(b"ZTxIdTranspaHash").to_state();
+                if let Some(ref td) = txid_parts.transparent_digests {
+                    h.update(td.prevouts_digest.as_bytes());
+                    h.update(td.sequence_digest.as_bytes());
+                    h.update(td.outputs_digest.as_bytes());
+                }
+                <[u8; 32]>::try_from(h.finalize().as_bytes()).unwrap()
+            };
+
+            // sapling_digest
+            let sapling_digest = match txid_parts.sapling_digest {
+                Some(d) => <[u8; 32]>::try_from(d.as_bytes()).unwrap(),
+                None => {
+                    let h = blake2b_simd::Params::new()
+                        .hash_length(32).personal(b"ZTxIdSaplingHash")
+                        .to_state().finalize();
+                    <[u8; 32]>::try_from(h.as_bytes()).unwrap()
+                }
+            };
+
+            debug!("header_digest: {}", hex::encode(txid_parts.header_digest.as_bytes()));
+            debug!("transparent_sig_digest: {}", hex::encode(transparent_sig_digest));
+            debug!("sapling_digest: {}", hex::encode(sapling_digest));
+            if let Some(ref od) = txid_parts.orchard_digest {
+                debug!("orchard_digest: {}", hex::encode(od.as_bytes()));
+            }
+
+            // Build TxMeta from TransactionData fields
+            let orchard = pczt::Pczt::parse(&pczt_bytes).unwrap();
+            let orchard_bundle = orchard.orchard();
+            let (magnitude, is_negative) = orchard_bundle.value_sum();
+            let value_balance = if *is_negative {
+                -(*magnitude as i64)
+            } else {
+                *magnitude as i64
+            };
+
+            TxMeta {
+                version: tx_data.version().header(),
+                version_group_id: tx_data.version().version_group_id(),
+                consensus_branch_id: u32::from(tx_data.consensus_branch_id()),
+                lock_time: tx_data.lock_time(),
+                expiry_height: u32::from(tx_data.expiry_height()),
+                orchard_flags: *orchard_bundle.flags(),
+                value_balance,
+                anchor: *orchard_bundle.anchor(),
+                transparent_sig_digest,
+                sapling_digest,
+                coin_type: coin_type_for_network(&self.network),
+            }
+        };
+
+        // Validate consensus_branch_id is Orchard-capable (Nu5+) BEFORE expensive proof generation
+        let branch_id = BranchId::try_from(tx_meta.consensus_branch_id).map_err(|_| {
+            HwSignerError::NetworkMismatch {
+                expected: coin_type_for_network(&self.network),
+                got: tx_meta.consensus_branch_id,
+            }
+        })?;
+        match branch_id {
+            BranchId::Nu5 | BranchId::Nu6 => {}
+            _ => {
+                return Err(HwSignerError::NetworkMismatch {
+                    expected: coin_type_for_network(&self.network),
+                    got: tx_meta.consensus_branch_id,
+                });
+            }
+        }
+
+        info!("PCZT parsed (v{}, branch_id=0x{:08x}, {:?}, lock_time={}).",
+              tx_meta.version, tx_meta.consensus_branch_id, self.network, tx_meta.lock_time);
+
+        info!("Running Orchard prover...");
+
+        // Step 2: Generate Orchard proof (Halo2)
+        let pczt_for_prover = pczt::Pczt::parse(&pczt_bytes)
+            .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse: {:?}", e)))?;
+        let prover = pczt::roles::prover::Prover::new(pczt_for_prover);
+        let orchard_pk = orchard::circuit::ProvingKey::build();
+        let proven = prover
+            .create_orchard_proof(&orchard_pk)
+            .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
+        let proven_pczt = proven.finish();
+
+        info!("Orchard proof generated. Initializing signer...");
+
+        // Step 3: Initialize Signer role and extract sighash
+        let mut signer_role = pczt::roles::signer::Signer::new(proven_pczt)
+            .map_err(|e| HwSignerError::SignerInitFailed(format!("{:?}", e)))?;
+
+        let mut sighash = signer_role.shielded_sighash();
+        info!("Sighash: {}...", hex::encode(&sighash[..8]));
+
+        // Step 4: Read action data from the Orchard bundle via the Signer.
+        // The upstream pczt Signer exposes the orchard bundle through
+        // sign_orchard / apply_orchard_signature. We read action data
+        // from the Pczt directly (before it was consumed by the Signer).
+        let pre_pczt = pczt::Pczt::parse(&pczt_bytes)
+            .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse: {:?}", e)))?;
+
+        // Use low_level_signer to access the parsed orchard::pczt::Bundle
+        // for reading alpha, rk, and action data through public getters.
+        let mut actions_to_sign: Vec<(usize, [u8; 32])> = Vec::new();
+        let mut all_actions_data: Vec<ActionData> = Vec::new();
+        let mut rk_values: Vec<[u8; 32]> = Vec::new();
+
+        let temp_signer = pczt::roles::low_level_signer::Signer::new(pre_pczt);
+        let _ = temp_signer
+            .sign_orchard_with(|_pczt, bundle, _tx_modifiable| -> std::result::Result<(), HwSignerError> {
+                for (i, action) in bundle.actions().iter().enumerate() {
+                    let spend = action.spend();
+                    rk_values.push(<[u8; 32]>::from(spend.rk().clone()));
+
+                    if let (Some(alpha), None) = (spend.alpha(), spend.spend_auth_sig()) {
+                        actions_to_sign.push((i, alpha.to_repr()));
+                    }
+
+                    let enc_note = action.output().encrypted_note();
+                    all_actions_data.push(ActionData {
+                        cv_net: action.cv_net().to_bytes(),
+                        nullifier: action.spend().nullifier().to_bytes(),
+                        rk: <[u8; 32]>::from(action.spend().rk().clone()),
+                        cmx: action.output().cmx().to_bytes(),
+                        ephemeral_key: enc_note.epk_bytes,
+                        enc_ciphertext: enc_note.enc_ciphertext.to_vec(),
+                        out_ciphertext: enc_note.out_ciphertext.to_vec(),
+                    });
+                }
+                Ok(())
+            })
+            .map_err(|e: HwSignerError| e)?;
+
+        if actions_to_sign.is_empty() {
+            return Err(HwSignerError::NoActionsToSign);
+        }
+
+        info!(
+            "{} total actions, {} need hardware signing",
+            all_actions_data.len(),
+            actions_to_sign.len()
+        );
+
+        // Step 5: Send action data to device for on-device sighash verification (v2)
+        self.signer.verify_sighash(&tx_meta, &all_actions_data, &sighash)?;
+
+        // Step 6: Request user confirmation on device (if details provided)
+        if let Some(ref details) = details {
+            let confirmed = self.signer.confirm_transaction(details)?;
+            if !confirmed {
+                return Err(HwSignerError::UserCancelled);
+            }
+        }
+
+        // Step 7: Sign each action via hardware wallet and apply signatures
+        let total_to_sign = actions_to_sign.len();
+        let mut actions_signed = 0usize;
+
+        let (amount, fee, recipient) = match &details {
+            Some(d) => (d.send_amount, d.fee, d.recipient.clone()),
+            None => (0, 0, String::new()),
+        };
+
+        for (sign_idx, (action_idx, alpha_bytes)) in actions_to_sign.iter().enumerate() {
+            let request = SignRequest {
+                sighash,
+                alpha: *alpha_bytes,
+                amount,
+                fee,
+                recipient: recipient.clone(),
+                action_index: sign_idx,
+                total_actions: total_to_sign,
+            };
+
+            let response = self.signer.sign_action(&request)?;
+
+            // Verify rk and signature
+            let pczt_rk = rk_values[*action_idx];
+            verify::verify_signature(&response, &sighash, &pczt_rk, *action_idx)?;
+
+            // Apply the signature to the PCZT via the upstream Signer API
+            let sig = orchard::primitives::redpallas::Signature::<orchard::primitives::redpallas::SpendAuth>::from(response.signature);
+            signer_role
+                .apply_orchard_signature(*action_idx, sig)
+                .map_err(|e| HwSignerError::SignerInitFailed(format!(
+                    "Failed to apply signature for action {}: {:?}", action_idx, e
+                )))?;
+
+            debug!("action[{}]: signed and verified OK", action_idx);
+            actions_signed += 1;
+        }
+
+        // Step 8: Finalize and return signed PCZT
+        sighash.zeroize();
+
+        let signed_pczt = signer_role.finish();
+        let signed_bytes = signed_pczt.serialize();
+
+        info!("PCZT signed ({} action(s) signed by hardware)", actions_signed);
+
+        Ok(SigningResult {
+            signed_pczt: signed_bytes,
+            actions_signed,
+        })
+    }
+}
