@@ -167,7 +167,7 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             }
         })?;
         match branch_id {
-            BranchId::Nu5 | BranchId::Nu6 => {}
+            BranchId::Nu5 | BranchId::Nu6 | BranchId::Nu6_1 => {}
             _ => {
                 return Err(HwSignerError::NetworkMismatch {
                     expected: self.signer.coin_type(),
