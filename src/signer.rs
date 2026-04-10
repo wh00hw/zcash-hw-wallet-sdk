@@ -8,19 +8,18 @@
 //! ```rust,ignore
 //! use zcash_hw_wallet_sdk::{DeviceSigner, PcztHardwareSigning};
 //! use zcash_hw_wallet_sdk::transport::SerialTransport;
-//! use zcash_protocol::consensus::Network;
+//! use zcash_hw_wallet_sdk::types::COIN_TYPE_TESTNET;
 //!
-//! // Connect to a hardware signing device over USB serial
+//! // Connect to a hardware signing device for testnet
 //! let transport = SerialTransport::new("/dev/ttyACM0", 115200)?;
-//! let mut signer = DeviceSigner::new(transport)?;
+//! let mut signer = DeviceSigner::new(transport, COIN_TYPE_TESTNET)?;
 //!
-//! // Export FVK for wallet pairing (testnet)
-//! use zcash_hw_wallet_sdk::types::coin_type_for_network;
-//! let fvk = signer.export_fvk(coin_type_for_network(&Network::TestNetwork))?;
+//! // Export FVK (uses the coin_type set at construction)
+//! let fvk = signer.export_fvk()?;
 //! println!("ak: {}", hex::encode(fvk.ak));
 //!
-//! // Use in signing workflow
-//! let mut workflow = PcztHardwareSigning::new(signer, Network::TestNetwork);
+//! // Sign — workflow reads coin_type from the signer
+//! let mut workflow = PcztHardwareSigning::new(signer);
 //! let result = workflow.sign(pczt_bytes)?;
 //! ```
 
@@ -35,32 +34,33 @@ use tracing::{debug, info};
 /// Generic hardware signer using the HWP protocol.
 ///
 /// Wraps an [`HwpCodec`] over any [`Transport`] implementation.
-/// Works with any device that speaks the HWP protocol (serial, TCP, etc.).
+/// The `coin_type` is set once at construction and used for all operations.
 pub struct DeviceSigner<T: Transport> {
     codec: HwpCodec<T>,
+    coin_type: u32,
 }
 
 impl<T: Transport> DeviceSigner<T> {
     /// Create a new DeviceSigner and perform the initial handshake.
     ///
-    /// Waits for a PING from the device and responds with PONG.
-    pub fn new(transport: T) -> Result<Self> {
+    /// The `coin_type` determines the network for all subsequent operations:
+    /// - `133` for mainnet, `1` for testnet (ZIP-32 derivation path)
+    pub fn new(transport: T, coin_type: u32) -> Result<Self> {
         let requires_handshake = transport.requires_handshake();
         let mut codec = HwpCodec::new(transport);
         if requires_handshake {
             info!("Waiting for device handshake...");
             codec.handshake()?;
         }
-        info!("Device connected.");
-        Ok(Self { codec })
+        info!("Device connected (coin_type={}).", coin_type);
+        Ok(Self { codec, coin_type })
     }
 
     /// Create a DeviceSigner without performing the handshake.
-    ///
-    /// Use this if you've already handled the PING/PONG exchange.
-    pub fn new_no_handshake(transport: T) -> Self {
+    pub fn new_no_handshake(transport: T, coin_type: u32) -> Self {
         Self {
             codec: HwpCodec::new(transport),
+            coin_type,
         }
     }
 
@@ -76,9 +76,13 @@ impl<T: Transport> DeviceSigner<T> {
 }
 
 impl<T: Transport> HardwareSigner for DeviceSigner<T> {
-    fn export_fvk(&mut self, coin_type: u32) -> Result<ExportedFvk> {
-        info!("Requesting FVK from device (coin_type={})...", coin_type);
-        let fvk = self.codec.request_fvk(coin_type)?;
+    fn coin_type(&self) -> u32 {
+        self.coin_type
+    }
+
+    fn export_fvk(&mut self) -> Result<ExportedFvk> {
+        info!("Requesting FVK from device (coin_type={})...", self.coin_type);
+        let fvk = self.codec.request_fvk(self.coin_type)?;
         debug!(ak = hex::encode(&fvk.ak), nk = hex::encode(&fvk.nk), rivk = hex::encode(&fvk.rivk), "FVK received from device");
         Ok(fvk)
     }
@@ -166,35 +170,35 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
 /// # Example
 ///
 /// ```rust,ignore
-/// let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0")?;
+/// use zcash_hw_wallet_sdk::types::COIN_TYPE_TESTNET;
+/// let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0", COIN_TYPE_TESTNET)?;
 /// ```
 #[cfg(feature = "serial")]
-pub fn connect_serial(port_path: &str) -> Result<DeviceSigner<crate::transport::SerialTransport>> {
+pub fn connect_serial(port_path: &str, coin_type: u32) -> Result<DeviceSigner<crate::transport::SerialTransport>> {
     let transport = crate::transport::SerialTransport::new(port_path, 115200)?;
-    DeviceSigner::new(transport)
+    DeviceSigner::new(transport, coin_type)
 }
 
 /// Connect to a Ledger hardware wallet over USB HID.
 ///
-/// Automatically finds the first connected Ledger device.
-/// The Zcash Orchard app must be open on the device.
-///
 /// ```rust,ignore
-/// let signer = zcash_hw_wallet_sdk::signer::connect_ledger()?;
+/// use zcash_hw_wallet_sdk::types::COIN_TYPE_MAINNET;
+/// let signer = zcash_hw_wallet_sdk::signer::connect_ledger(COIN_TYPE_MAINNET)?;
 /// ```
 #[cfg(feature = "ledger")]
-pub fn connect_ledger() -> Result<DeviceSigner<crate::transport::LedgerTransport>> {
+pub fn connect_ledger(coin_type: u32) -> Result<DeviceSigner<crate::transport::LedgerTransport>> {
     let transport = crate::transport::LedgerTransport::open()?;
-    DeviceSigner::new(transport)
+    DeviceSigner::new(transport, coin_type)
 }
 
 /// Connect to a Ledger app running on Speculos emulator.
 ///
 /// ```rust,ignore
-/// let signer = zcash_hw_wallet_sdk::signer::connect_speculos("127.0.0.1:9999")?;
+/// use zcash_hw_wallet_sdk::types::COIN_TYPE_TESTNET;
+/// let signer = zcash_hw_wallet_sdk::signer::connect_speculos("127.0.0.1:9999", COIN_TYPE_TESTNET)?;
 /// ```
 #[cfg(feature = "ledger")]
-pub fn connect_speculos(addr: &str) -> Result<DeviceSigner<crate::transport::SpeculosTransport>> {
+pub fn connect_speculos(addr: &str, coin_type: u32) -> Result<DeviceSigner<crate::transport::SpeculosTransport>> {
     let transport = crate::transport::SpeculosTransport::open(addr)?;
-    DeviceSigner::new(transport)
+    DeviceSigner::new(transport, coin_type)
 }

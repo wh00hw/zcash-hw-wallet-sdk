@@ -67,7 +67,7 @@ use zcash_hw_wallet_sdk::{DeviceSigner, PcztHardwareSigning};
 let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0")?;
 
 // Sign a PCZT (from zcash_client_backend::create_pczt_from_proposal)
-let mut workflow = PcztHardwareSigning::new(signer);
+let mut workflow = PcztHardwareSigning::new(signer, Network::TestNetwork);
 let result = workflow.sign(pczt_bytes)?;
 
 // result.signed_pczt -> extract_and_store_transaction_from_pczt()
@@ -86,7 +86,7 @@ use zcash_hw_wallet_sdk::{DeviceSigner, PcztHardwareSigning};
 // Auto-detect the first connected Ledger (Zcash Orchard app must be open)
 let signer = zcash_hw_wallet_sdk::signer::connect_ledger()?;
 
-let mut workflow = PcztHardwareSigning::new(signer);
+let mut workflow = PcztHardwareSigning::new(signer, Network::MainNetwork);
 let result = workflow.sign(pczt_bytes)?;
 ```
 

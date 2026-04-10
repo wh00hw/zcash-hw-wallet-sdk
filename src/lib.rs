@@ -21,13 +21,13 @@
 //!
 //! ```rust,ignore
 //! use zcash_hw_wallet_sdk::{DeviceSigner, PcztHardwareSigning};
-//! use zcash_protocol::consensus::Network;
+//! use zcash_hw_wallet_sdk::types::COIN_TYPE_TESTNET;
 //!
-//! // Connect to a hardware signing device over USB serial
-//! let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0")?;
+//! // Connect to a hardware signing device (testnet)
+//! let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0", COIN_TYPE_TESTNET)?;
 //!
 //! // Sign a PCZT (from zcash_client_backend::create_pczt_from_proposal)
-//! let mut workflow = PcztHardwareSigning::new(signer, Network::TestNetwork);
+//! let mut workflow = PcztHardwareSigning::new(signer);
 //! let result = workflow.sign(pczt_bytes)?;
 //!
 //! // Pass result.signed_pczt to extract_and_store_transaction_from_pczt
@@ -39,11 +39,13 @@
 //! use zcash_hw_wallet_sdk::*;
 //! use zcash_hw_wallet_sdk::types::COIN_TYPE_TESTNET;
 //!
-//! struct MyHsm { /* ... */ }
+//! struct MyHsm { coin_type: u32 }
 //!
 //! impl HardwareSigner for MyHsm {
-//!     fn export_fvk(&mut self, coin_type: u32) -> error::Result<ExportedFvk> {
-//!         // Read FVK components from your HSM for the given network
+//!     fn coin_type(&self) -> u32 { self.coin_type }
+//!
+//!     fn export_fvk(&mut self) -> error::Result<ExportedFvk> {
+//!         // Read FVK components — use self.coin_type() for derivation
 //!         todo!()
 //!     }
 //!

@@ -17,11 +17,13 @@ use crate::types::{ActionData, ExportedFvk, SignRequest, SignResponse, TxDetails
 /// use zcash_hw_wallet_sdk::{HardwareSigner, SignRequest, SignResponse, ExportedFvk, TxDetails};
 /// use zcash_hw_wallet_sdk::types::COIN_TYPE_TESTNET;
 ///
-/// struct MyDevice { /* ... */ }
+/// struct MyDevice { coin_type: u32 }
 ///
 /// impl HardwareSigner for MyDevice {
-///     fn export_fvk(&mut self, coin_type: u32) -> Result<ExportedFvk> {
-///         // Read FVK components from hardware for the given network
+///     fn coin_type(&self) -> u32 { self.coin_type }
+///
+///     fn export_fvk(&mut self) -> Result<ExportedFvk> {
+///         // Read FVK components from hardware (uses self.coin_type() internally)
 ///         todo!()
 ///     }
 ///
@@ -29,24 +31,23 @@ use crate::types::{ActionData, ExportedFvk, SignRequest, SignResponse, TxDetails
 ///         // Send sighash + alpha to device, receive signature + rk
 ///         todo!()
 ///     }
-///
-///     fn confirm_transaction(&mut self, details: &TxDetails) -> Result<bool> {
-///         // Display transaction on device screen, wait for user confirmation
-///         todo!()
-///     }
 /// }
 /// ```
 pub trait HardwareSigner {
-    /// Export the Orchard full viewing key from the hardware device.
+    /// The ZIP-32 coin type this signer is configured for.
     ///
-    /// The `coin_type` parameter specifies the ZIP-32 derivation path:
     /// - `133` for mainnet (`m/32'/133'/account'`)
     /// - `1` for testnet (`m/32'/1'/account'`)
     ///
-    /// This is typically called once during initial wallet pairing. The FVK
-    /// is used by the companion software to derive addresses and scan the
-    /// blockchain — the spending key never leaves the device.
-    fn export_fvk(&mut self, coin_type: u32) -> Result<ExportedFvk>;
+    /// Set once at construction time. Used by the SDK to populate TxMeta
+    /// and validate network consistency throughout the signing workflow.
+    fn coin_type(&self) -> u32;
+
+    /// Export the Orchard full viewing key from the hardware device.
+    ///
+    /// Uses the signer's `coin_type()` to derive keys from the correct
+    /// ZIP-32 path. Typically called once during initial wallet pairing.
+    fn export_fvk(&mut self) -> Result<ExportedFvk>;
 
     /// Sign a single Orchard action.
     ///

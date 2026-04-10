@@ -39,7 +39,11 @@ impl MockSigner {
 }
 
 impl HardwareSigner for MockSigner {
-    fn export_fvk(&mut self, _coin_type: u32) -> Result<ExportedFvk> {
+    fn coin_type(&self) -> u32 {
+        1 // testnet
+    }
+
+    fn export_fvk(&mut self) -> Result<ExportedFvk> {
         Ok(self.fvk.clone())
     }
 
@@ -305,7 +309,7 @@ fn test_codec_crc_mismatch_detected() {
 #[test]
 fn test_mock_signer_export_fvk() {
     let mut signer = MockSigner::new();
-    let fvk = signer.export_fvk(1).unwrap();
+    let fvk = signer.export_fvk().unwrap();
     assert_eq!(fvk.ak, [0xAA; 32]);
     assert_eq!(fvk.nk, [0xBB; 32]);
     assert_eq!(fvk.rivk, [0xCC; 32]);

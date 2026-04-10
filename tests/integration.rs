@@ -40,10 +40,10 @@ fn device_addr() -> String {
     std::env::var("VIRTUAL_DEVICE_ADDR").unwrap_or_else(|_| "127.0.0.1:9999".to_string())
 }
 
-fn connect_signer() -> DeviceSigner<TcpTransport> {
+fn connect_signer(coin_type: u32) -> DeviceSigner<TcpTransport> {
     let transport =
         TcpTransport::connect(&device_addr()).expect("Failed to connect to virtual device");
-    DeviceSigner::new(transport).expect("Handshake failed")
+    DeviceSigner::new(transport, coin_type).expect("Handshake failed")
 }
 
 fn connect_codec() -> HwpCodec<TcpTransport> {
@@ -176,7 +176,7 @@ fn compute_zip244_sighash(meta: &TxMeta, actions: &[ActionData]) -> [u8; 32] {
 
 #[test]
 fn test_handshake() {
-    let _signer = connect_signer();
+    let _signer = connect_signer(COIN_TYPE_MAINNET);
     // If we get here, PING/PONG succeeded
 }
 
@@ -184,9 +184,9 @@ fn test_handshake() {
 
 #[test]
 fn test_fvk_export_mainnet() {
-    let mut signer = connect_signer();
+    let mut signer = connect_signer(COIN_TYPE_MAINNET);
     let fvk = signer
-        .export_fvk(COIN_TYPE_MAINNET)
+        .export_fvk()
         .expect("FVK export failed");
 
     assert_eq!(fvk.ak, EXPECTED_AK, "ak mismatch");
@@ -202,9 +202,9 @@ fn test_fvk_export_mainnet() {
 
 #[test]
 fn test_fvk_export_testnet() {
-    let mut signer = connect_signer();
+    let mut signer = connect_signer(COIN_TYPE_TESTNET);
     let fvk_testnet = signer
-        .export_fvk(COIN_TYPE_TESTNET)
+        .export_fvk()
         .expect("FVK export failed");
 
     assert_ne!(
@@ -215,12 +215,12 @@ fn test_fvk_export_testnet() {
 
 #[test]
 fn test_fvk_export_twice_same_result() {
-    let mut signer = connect_signer();
+    let mut signer = connect_signer(COIN_TYPE_MAINNET);
     let fvk1 = signer
-        .export_fvk(COIN_TYPE_MAINNET)
+        .export_fvk()
         .expect("FVK export 1 failed");
     let fvk2 = signer
-        .export_fvk(COIN_TYPE_MAINNET)
+        .export_fvk()
         .expect("FVK export 2 failed");
     assert_eq!(fvk1.ak, fvk2.ak, "FVK should be deterministic");
 }
@@ -496,15 +496,15 @@ fn test_invalid_state_action_without_metadata() {
 #[test]
 fn test_reconnect_clean_session() {
     {
-        let mut signer = connect_signer();
+        let mut signer = connect_signer(COIN_TYPE_MAINNET);
         let _ = signer
-            .export_fvk(COIN_TYPE_MAINNET)
+            .export_fvk()
             .expect("FVK 1 failed");
     }
     {
-        let mut signer = connect_signer();
+        let mut signer = connect_signer(COIN_TYPE_MAINNET);
         let fvk = signer
-            .export_fvk(COIN_TYPE_MAINNET)
+            .export_fvk()
             .expect("FVK 2 failed");
         assert_eq!(fvk.ak, EXPECTED_AK, "FVK should match after reconnect");
     }

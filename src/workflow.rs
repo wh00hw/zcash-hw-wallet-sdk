@@ -11,12 +11,12 @@
 
 use crate::error::{HwSignerError, Result};
 use crate::traits::HardwareSigner;
-use crate::types::{coin_type_for_network, ActionData, SignRequest, SigningResult, TxDetails, TxMeta};
+use crate::types::{ActionData, SignRequest, SigningResult, TxDetails, TxMeta};
 use crate::verify;
 
 use ff::PrimeField;
 use tracing::{debug, info};
-use zcash_protocol::consensus::{BranchId, Network};
+use zcash_protocol::consensus::BranchId;
 use zeroize::Zeroize;
 
 /// High-level PCZT hardware signing workflow.
@@ -31,31 +31,29 @@ use zeroize::Zeroize;
 /// ```rust,ignore
 /// use zcash_hw_wallet_sdk::{PcztHardwareSigning, DeviceSigner};
 /// use zcash_hw_wallet_sdk::transport::SerialTransport;
-/// use zcash_protocol::consensus::Network;
+/// use zcash_hw_wallet_sdk::types::COIN_TYPE_TESTNET;
 ///
-/// // Create the signer connected to a hardware device
+/// // Create the signer connected to a hardware device (testnet)
 /// let transport = SerialTransport::new("/dev/ttyACM0", 115200)?;
-/// let signer = DeviceSigner::new(transport)?;
+/// let signer = DeviceSigner::new(transport, COIN_TYPE_TESTNET)?;
 ///
-/// // Sign a PCZT (obtained from zcash_client_backend::create_pczt_from_proposal)
-/// let mut workflow = PcztHardwareSigning::new(signer, Network::TestNetwork);
+/// // Sign a PCZT — the workflow reads coin_type from the signer
+/// let mut workflow = PcztHardwareSigning::new(signer);
 /// let result = workflow.sign(pczt_bytes)?;
 ///
 /// // result.signed_pczt can be passed to extract_and_store_transaction_from_pczt
 /// ```
 pub struct PcztHardwareSigning<S: HardwareSigner> {
     signer: S,
-    network: Network,
 }
 
 impl<S: HardwareSigner> PcztHardwareSigning<S> {
     /// Create a new workflow manager wrapping a hardware signer.
     ///
-    /// The `network` parameter determines:
-    /// - The `coin_type` sent to the device in TxMeta (133 mainnet, 1 testnet)
-    /// - Pre-proof validation that the PCZT's consensus_branch_id is Orchard-capable
-    pub fn new(signer: S, network: Network) -> Self {
-        Self { signer, network }
+    /// The signer's `coin_type()` determines the network for TxMeta
+    /// and is validated against the PCZT's consensus_branch_id.
+    pub fn new(signer: S) -> Self {
+        Self { signer }
     }
 
     /// Get a reference to the underlying signer.
@@ -157,14 +155,14 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                 anchor: *orchard_bundle.anchor(),
                 transparent_sig_digest,
                 sapling_digest,
-                coin_type: coin_type_for_network(&self.network),
+                coin_type: self.signer.coin_type(),
             }
         };
 
         // Validate consensus_branch_id is Orchard-capable (Nu5+) BEFORE expensive proof generation
         let branch_id = BranchId::try_from(tx_meta.consensus_branch_id).map_err(|_| {
             HwSignerError::NetworkMismatch {
-                expected: coin_type_for_network(&self.network),
+                expected: self.signer.coin_type(),
                 got: tx_meta.consensus_branch_id,
             }
         })?;
@@ -172,14 +170,14 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             BranchId::Nu5 | BranchId::Nu6 => {}
             _ => {
                 return Err(HwSignerError::NetworkMismatch {
-                    expected: coin_type_for_network(&self.network),
+                    expected: self.signer.coin_type(),
                     got: tx_meta.consensus_branch_id,
                 });
             }
         }
 
         info!("PCZT parsed (v{}, branch_id=0x{:08x}, {:?}, lock_time={}).",
-              tx_meta.version, tx_meta.consensus_branch_id, self.network, tx_meta.lock_time);
+              tx_meta.version, tx_meta.consensus_branch_id, tx_meta.coin_type, tx_meta.lock_time);
 
         info!("Running Orchard prover...");
 
