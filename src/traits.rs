@@ -1,5 +1,8 @@
-use crate::error::Result;
-use crate::types::{ActionData, ExportedFvk, SignRequest, SignResponse, TxDetails, TxMeta};
+use crate::error::{HwSignerError, Result};
+use crate::types::{
+    ActionData, ExportedFvk, SignRequest, SignResponse, TransparentInputData,
+    TransparentOutputData, TransparentSignRequest, TransparentSignResponse, TxDetails, TxMeta,
+};
 
 /// Trait that any hardware wallet must implement to participate in
 /// PCZT-based Zcash Orchard transaction signing.
@@ -86,6 +89,40 @@ pub trait HardwareSigner {
         _meta: &TxMeta,
         _actions: &[ActionData],
         _sighash: &[u8; 32],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Sign a single transparent input (ECDSA secp256k1).
+    ///
+    /// Unlike Orchard/Sapling where the shielded sighash is shared across all
+    /// spends, transparent has a **per-input sighash** that commits to the
+    /// specific input's script and value.
+    ///
+    /// The default implementation returns `UnsupportedPool` — Orchard-only
+    /// devices don't need to implement this.
+    fn sign_transparent_input(
+        &mut self,
+        _request: &TransparentSignRequest,
+    ) -> Result<TransparentSignResponse> {
+        Err(HwSignerError::UnsupportedPool("transparent"))
+    }
+
+    /// Send transparent inputs and outputs to the device for on-device
+    /// transparent digest verification (HWP v3).
+    ///
+    /// The device independently computes the ZIP-244 transparent digest
+    /// from the raw inputs/outputs and compares it with the pre-computed
+    /// `transparent_sig_digest` in TxMeta. This prevents a compromised
+    /// companion from providing a forged transparent digest.
+    ///
+    /// The default implementation is a no-op (v2 behavior: device trusts
+    /// the pre-computed transparent digest from the companion).
+    fn verify_transparent_digest(
+        &mut self,
+        _inputs: &[TransparentInputData],
+        _outputs: &[TransparentOutputData],
+        _expected_digest: &[u8; 32],
     ) -> Result<()> {
         Ok(())
     }

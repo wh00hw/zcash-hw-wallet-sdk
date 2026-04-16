@@ -11,6 +11,7 @@
 //! Frame format: `[MAGIC:1][VERSION:1][SEQ:1][TYPE:1][LENGTH:2 LE][PAYLOAD:N][CRC16:2 LE]`
 
 pub mod hwp;
+pub mod hanh;
 
 pub use hwp::{
     ErrorCode, HwpCodec, Frame, MsgType, HWP_HEADER_SIZE, HWP_MAGIC, HWP_MAX_PAYLOAD,

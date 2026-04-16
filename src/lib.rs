@@ -62,6 +62,8 @@ pub mod signer;
 pub mod traits;
 pub mod transport;
 pub mod types;
+#[cfg(feature = "ledger")]
+pub mod ledger_client;
 pub mod verify;
 pub mod workflow;
 
@@ -70,7 +72,9 @@ pub use error::{HwSignerError, Result};
 pub use signer::DeviceSigner;
 pub use traits::HardwareSigner;
 pub use types::{
-    ActionData, ExportedFvk, SignRequest, SignResponse, SigningResult, TxDetails, TxMeta,
+    ActionData, ExportedFvk, SignRequest, SignResponse, SigningResult,
+    TransparentInputData, TransparentOutputData, TransparentSignRequest,
+    TransparentSignResponse, TxDetails, TxMeta,
 };
 pub use workflow::PcztHardwareSigning;
 

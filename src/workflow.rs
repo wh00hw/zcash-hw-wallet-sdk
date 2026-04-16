@@ -11,7 +11,10 @@
 
 use crate::error::{HwSignerError, Result};
 use crate::traits::HardwareSigner;
-use crate::types::{ActionData, SignRequest, SigningResult, TxDetails, TxMeta};
+use crate::types::{
+    ActionData, SignRequest, SigningResult, TransparentInputData, TransparentOutputData,
+    TransparentSignRequest, TxDetails, TxMeta,
+};
 use crate::verify;
 
 use ff::PrimeField;
@@ -298,17 +301,95 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             actions_signed += 1;
         }
 
-        // Step 8: Finalize and return signed PCZT
+        // Step 8: Transparent signing (if transparent inputs present)
+        let mut transparent_inputs_signed = 0usize;
+        {
+            let t_pczt = pczt::Pczt::parse(&pczt_bytes)
+                .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse for transparent: {:?}", e)))?;
+            let t_inputs = t_pczt.transparent().inputs();
+            let t_outputs = t_pczt.transparent().outputs();
+
+            if !t_inputs.is_empty() {
+                info!("{} transparent input(s), {} output(s) — starting transparent flow",
+                      t_inputs.len(), t_outputs.len());
+
+                // 8a. Extract transparent input/output data for on-device digest verification
+                let input_data: Vec<TransparentInputData> = t_inputs.iter().map(|inp| {
+                    TransparentInputData {
+                        prevout_hash: *inp.prevout_txid(),
+                        prevout_index: *inp.prevout_index(),
+                        sequence: inp.sequence().unwrap_or(0xFFFFFFFF),
+                        value: *inp.value(),
+                        script_pubkey: inp.script_pubkey().clone(),
+                    }
+                }).collect();
+
+                let output_data: Vec<TransparentOutputData> = t_outputs.iter().map(|out| {
+                    TransparentOutputData {
+                        value: *out.value(),
+                        script_pubkey: out.script_pubkey().clone(),
+                    }
+                }).collect();
+
+                // 8b. Send to device for on-device transparent digest verification (v3)
+                self.signer.verify_transparent_digest(
+                    &input_data,
+                    &output_data,
+                    &tx_meta.transparent_sig_digest,
+                )?;
+
+                // 8c. Sign each transparent input that needs a hardware signature
+                for i in 0..t_inputs.len() {
+                    // Get the per-input sighash from the pczt signer
+                    let t_sighash = signer_role.transparent_sighash(i)
+                        .map_err(|e| HwSignerError::SignerInitFailed(format!(
+                            "transparent_sighash({}) failed: {:?}", i, e
+                        )))?;
+
+                    let request = TransparentSignRequest {
+                        sighash: t_sighash,
+                        input_index: i,
+                        total_inputs: t_inputs.len(),
+                        value: *t_inputs[i].value(),
+                        script_pubkey: t_inputs[i].script_pubkey().clone(),
+                    };
+
+                    let response = self.signer.sign_transparent_input(&request)?;
+
+                    // Parse the ECDSA signature and inject into PCZT
+                    let ecdsa_sig = secp256k1::ecdsa::Signature::from_der(&response.signature[..response.signature.len().saturating_sub(1)])
+                        .map_err(|e| HwSignerError::TransparentSignatureVerificationFailed {
+                            input_idx: i,
+                            reason: format!("Invalid DER signature: {}", e),
+                        })?;
+
+                    signer_role
+                        .append_transparent_signature(i, ecdsa_sig)
+                        .map_err(|e| HwSignerError::SignerInitFailed(format!(
+                            "Failed to apply transparent signature for input {}: {:?}", i, e
+                        )))?;
+
+                    debug!("transparent input[{}]: signed and applied OK", i);
+                    transparent_inputs_signed += 1;
+                }
+
+                info!("{} transparent input(s) signed by hardware", transparent_inputs_signed);
+            }
+        }
+
+        // Step 9: Finalize and return signed PCZT
         sighash.zeroize();
 
         let signed_pczt = signer_role.finish();
         let signed_bytes = signed_pczt.serialize();
 
-        info!("PCZT signed ({} action(s) signed by hardware)", actions_signed);
+        info!("PCZT signed ({} orchard action(s) + {} transparent input(s) signed by hardware)",
+              actions_signed, transparent_inputs_signed);
 
         Ok(SigningResult {
             signed_pczt: signed_bytes,
             actions_signed,
+            transparent_inputs_signed,
         })
     }
 }

@@ -31,17 +31,17 @@ This SDK adds the **hardware signer role** to the PCZT ecosystem.
 
 ```
 +-----------------------------------------------------+
-|                  Wallet Application                  |
-|              (Zashi, YWallet, custom)                |
+|                  Wallet Application                 |
+|              (Zashi, YWallet, custom)               |
 +-----------------------------------------------------+
-|                zcash-hw-wallet-sdk                   |
-|  +-------------+  +------------+  +----------------+ |
-|  |    PCZT     |  | Hardware   |  | Transport      | |
-|  |  Workflow   |  | Signer     |  | Serial/Ledger/ | |
-|  |  Manager    |  | Trait      |  | QR             | |
-|  +-------------+  +------------+  +----------------+ |
+|                zcash-hw-wallet-sdk                  |
+|  +-------------+  +------------+  +---------------+ |
+|  |    PCZT     |  | Hardware   |  | Transport     | |
+|  |  Workflow   |  | Signer     |  | Serial/Ledger/| |
+|  |  Manager    |  | Trait      |  | QR            | |
+|  +-------------+  +------------+  +---------------+ |
 +-----------------------------------------------------+
-|            librustzcash (pczt, orchard)               |
+|            librustzcash (pczt, orchard)             |
 +-----------------------------------------------------+
         |                              |
         v                              v
@@ -73,7 +73,7 @@ let result = workflow.sign(pczt_bytes)?;
 // result.signed_pczt -> extract_and_store_transaction_from_pczt()
 ```
 
-### Sign a transaction with a Ledger device
+### Sign a transaction with a Ledger device (PCZT/HWP Wrapper)
 
 ```toml
 [dependencies]
@@ -88,6 +88,25 @@ let signer = zcash_hw_wallet_sdk::signer::connect_ledger()?;
 
 let mut workflow = PcztHardwareSigning::new(signer, Network::MainNetwork);
 let result = workflow.sign(pczt_bytes)?;
+```
+
+### Sign a transaction with Ledger natively (Hanh's APDU App builder)
+
+Instead of the blind PCZT flow, this SDK offers parallel bindings for Hanh's native "builder" app on Ledger:
+
+```rust
+let client = zcash_hw_wallet_sdk::signer::connect_ledger_apdu()?;
+
+// 1. Initialize TX state machine
+client.init_tx()?;
+
+// 2. Provide plaintext action data (device re-computes commitments internally)
+client.add_o_action(&nf, &address, amount, &epk, &enc, true)?;
+
+// 3. Confirm and sign
+client.confirm_fee(true)?;
+let signature = client.sign_orchard(Some(&alpha))?;
+client.end_tx()?;
 ```
 
 For development with the Speculos emulator:

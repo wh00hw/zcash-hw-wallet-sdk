@@ -2730,6 +2730,7 @@ dependencies = [
  "qrcode",
  "reddsa",
  "rqrr",
+ "secp256k1",
  "serde",
  "serde_json",
  "serialport",

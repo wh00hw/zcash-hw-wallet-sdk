@@ -95,7 +95,7 @@ impl LedgerTransport {
     ///
     /// Handles Ledger HID framing: fragments the APDU into 64-byte
     /// HID packets with channel/tag/sequence headers.
-    fn apdu_exchange(&self, cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Result<Vec<u8>> {
+    pub fn apdu_exchange(&self, cla: u8, ins: u8, p1: u8, p2: u8, data: &[u8]) -> Result<Vec<u8>> {
         // Build APDU: [CLA, INS, P1, P2, Lc, Data...]
         let mut apdu = Vec::with_capacity(5 + data.len());
         apdu.push(cla);

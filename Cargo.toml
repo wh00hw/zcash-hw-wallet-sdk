@@ -38,6 +38,7 @@ pczt = { version = "0.5", features = ["io-finalizer", "prover", "signer", "spend
 orchard = "0.12"
 reddsa = "0.5"
 ff = "0.13"
+secp256k1 = "0.29"
 zcash_address = "0.10"
 zcash_primitives = "0.26"
 zcash_protocol = "0.7"

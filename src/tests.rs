@@ -195,17 +195,17 @@ fn test_parse_error_with_message() {
 
 #[test]
 fn test_msg_type_roundtrip() {
-    for v in 0x01..=0x0Au8 {
+    for v in 0x01..=0x0Cu8 {
         let mt = MsgType::from_u8(v).unwrap();
         assert_eq!(mt as u8, v);
     }
     assert!(MsgType::from_u8(0x00).is_none());
-    assert!(MsgType::from_u8(0x0B).is_none());
+    assert!(MsgType::from_u8(0x0D).is_none());
 }
 
 #[test]
 fn test_error_code_roundtrip() {
-    for v in 0x01..=0x0Au8 {
+    for v in 0x01..=0x0Bu8 {
         let ec = protocol::ErrorCode::from_u8(v);
         assert_eq!(ec as u8, v);
     }

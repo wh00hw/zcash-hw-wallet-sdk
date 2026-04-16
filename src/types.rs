@@ -193,6 +193,73 @@ impl ActionData {
     }
 }
 
+/// Transparent input data for on-device sighash verification (HWP v3).
+///
+/// Contains the fields the device needs to independently compute the
+/// ZIP-244 transparent prevouts, sequences, and amounts digests.
+///
+/// Wire format per input:
+/// `prevout_hash(32) || prevout_index(4 LE) || sequence(4 LE) ||
+///  value(8 LE) || script_pubkey_len(2 LE) || script_pubkey(N)`
+#[derive(Debug, Clone)]
+pub struct TransparentInputData {
+    /// Previous transaction hash (32 bytes).
+    pub prevout_hash: [u8; 32],
+    /// Previous output index.
+    pub prevout_index: u32,
+    /// Input sequence number.
+    pub sequence: u32,
+    /// Value of the coin being spent in zatoshis.
+    pub value: u64,
+    /// The scriptPubKey of the coin being spent.
+    pub script_pubkey: Vec<u8>,
+}
+
+impl TransparentInputData {
+    /// Serialize to the wire format for TxTransparentInput messages.
+    ///
+    /// Layout: `prevout_hash(32) || prevout_index(4 LE) || sequence(4 LE) ||
+    ///          value(8 LE) || script_pubkey_len(2 LE) || script_pubkey(N)`
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 4 + 4 + 8 + 2 + self.script_pubkey.len());
+        buf.extend_from_slice(&self.prevout_hash);
+        buf.extend_from_slice(&self.prevout_index.to_le_bytes());
+        buf.extend_from_slice(&self.sequence.to_le_bytes());
+        buf.extend_from_slice(&self.value.to_le_bytes());
+        buf.extend_from_slice(&(self.script_pubkey.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&self.script_pubkey);
+        buf
+    }
+}
+
+/// Transparent output data for on-device sighash verification (HWP v3).
+///
+/// Contains the fields the device needs to independently compute the
+/// ZIP-244 transparent outputs digest.
+///
+/// Wire format per output:
+/// `value(8 LE) || script_pubkey_len(2 LE) || script_pubkey(N)`
+#[derive(Debug, Clone)]
+pub struct TransparentOutputData {
+    /// Output value in zatoshis.
+    pub value: u64,
+    /// The scriptPubKey (locking script).
+    pub script_pubkey: Vec<u8>,
+}
+
+impl TransparentOutputData {
+    /// Serialize to the wire format for TxTransparentOutput messages.
+    ///
+    /// Layout: `value(8 LE) || script_pubkey_len(2 LE) || script_pubkey(N)`
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + 2 + self.script_pubkey.len());
+        buf.extend_from_slice(&self.value.to_le_bytes());
+        buf.extend_from_slice(&(self.script_pubkey.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&self.script_pubkey);
+        buf
+    }
+}
+
 /// Transaction metadata for on-device ZIP-244 sighash computation.
 ///
 /// Contains the header fields and Orchard bundle metadata that the device
@@ -283,6 +350,40 @@ impl TxMeta {
     }
 }
 
+/// Request sent to a hardware device for signing a single transparent input.
+///
+/// Unlike Orchard/Sapling (shared shielded sighash), transparent has a
+/// **per-input sighash** — each input commits to its own script and value.
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+pub struct TransparentSignRequest {
+    /// The ZIP-244 per-input sighash (32 bytes).
+    pub sighash: [u8; 32],
+
+    /// Zero-based index of this input within the transparent bundle.
+    pub input_index: usize,
+
+    /// Total number of transparent inputs requiring signatures.
+    pub total_inputs: usize,
+
+    /// Value of the UTXO being spent in zatoshis (for device display).
+    pub value: u64,
+
+    /// The scriptPubKey of the UTXO being spent (for device display/validation).
+    pub script_pubkey: Vec<u8>,
+}
+
+/// Response from a hardware device after signing a transparent input.
+///
+/// Contains a DER-encoded ECDSA signature and the compressed public key.
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+pub struct TransparentSignResponse {
+    /// DER-encoded ECDSA signature with appended sighash_type byte.
+    pub signature: Vec<u8>,
+
+    /// Compressed secp256k1 public key (33 bytes).
+    pub pubkey: [u8; 33],
+}
+
 /// Outcome of a completed hardware signing workflow.
 #[derive(Debug, Clone)]
 pub struct SigningResult {
@@ -291,4 +392,7 @@ pub struct SigningResult {
 
     /// Number of Orchard actions that were signed by hardware.
     pub actions_signed: usize,
+
+    /// Number of transparent inputs that were signed by hardware.
+    pub transparent_inputs_signed: usize,
 }

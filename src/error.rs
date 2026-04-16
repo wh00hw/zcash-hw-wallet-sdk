@@ -43,6 +43,18 @@ pub enum HwSignerError {
     #[error("User cancelled signing on device")]
     UserCancelled,
 
+    #[error("Transparent sighash verification failed: device-computed transparent digest does not match")]
+    TransparentSighashMismatch,
+
+    #[error("Invalid transparent input index {index} (bundle has {input_count} inputs)")]
+    InvalidTransparentInputIndex { index: usize, input_count: usize },
+
+    #[error("Unsupported pool: {0}")]
+    UnsupportedPool(&'static str),
+
+    #[error("Transparent signature verification failed on input {input_idx}: {reason}")]
+    TransparentSignatureVerificationFailed { input_idx: usize, reason: String },
+
     // ── Transport errors ────────────────────────────────────────────────
     #[error("Transport error: {0}")]
     TransportError(String),

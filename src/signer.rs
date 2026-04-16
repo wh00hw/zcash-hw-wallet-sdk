@@ -27,7 +27,10 @@ use crate::error::Result;
 use crate::protocol::HwpCodec;
 use crate::traits::HardwareSigner;
 use crate::transport::Transport;
-use crate::types::{ActionData, ExportedFvk, SignRequest, SignResponse, TxDetails, TxMeta};
+use crate::types::{
+    ActionData, ExportedFvk, SignRequest, SignResponse, TransparentInputData,
+    TransparentOutputData, TxDetails, TxMeta,
+};
 
 use tracing::{debug, info};
 
@@ -161,6 +164,54 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
 
         Ok(())
     }
+
+    fn verify_transparent_digest(
+        &mut self,
+        inputs: &[TransparentInputData],
+        outputs: &[TransparentOutputData],
+        expected_digest: &[u8; 32],
+    ) -> Result<()> {
+        let num_inputs = inputs.len() as u16;
+        let num_outputs = outputs.len() as u16;
+        info!(
+            "Sending {} transparent input(s) + {} output(s) to device for digest verification (v3)...",
+            num_inputs, num_outputs
+        );
+
+        // 1. Send each transparent input
+        for (i, input) in inputs.iter().enumerate() {
+            let data = input.serialize();
+            self.codec
+                .send_transparent_input(i as u16, num_inputs, &data)?;
+            debug!(
+                "TxTransparentInput {}/{} sent ({} bytes)",
+                i + 1,
+                num_inputs,
+                data.len()
+            );
+        }
+
+        // 2. Send each transparent output
+        for (i, output) in outputs.iter().enumerate() {
+            let data = output.serialize();
+            self.codec
+                .send_transparent_output(i as u16, num_outputs, &data)?;
+            debug!(
+                "TxTransparentOutput {}/{} sent ({} bytes)",
+                i + 1,
+                num_outputs,
+                data.len()
+            );
+        }
+
+        // 3. Send expected digest as sentinel (index == total_inputs)
+        // Device compares its computed transparent digest with this value.
+        self.codec
+            .send_transparent_input(num_inputs, num_inputs, expected_digest)?;
+        info!("Transparent digest verified — device confirmed match.");
+
+        Ok(())
+    }
 }
 
 /// Create a [`DeviceSigner`] over USB serial.
@@ -189,6 +240,17 @@ pub fn connect_serial(port_path: &str, coin_type: u32) -> Result<DeviceSigner<cr
 pub fn connect_ledger(coin_type: u32) -> Result<DeviceSigner<crate::transport::LedgerTransport>> {
     let transport = crate::transport::LedgerTransport::open()?;
     DeviceSigner::new(transport, coin_type)
+}
+
+/// Connect to a Ledger hardware wallet using the native APDU client (Hahn app).
+///
+/// ```rust,ignore
+/// let client = zcash_hw_wallet_sdk::signer::connect_ledger_apdu()?;
+/// ```
+#[cfg(feature = "ledger")]
+pub fn connect_ledger_apdu() -> Result<crate::ledger_client::LedgerClient> {
+    let transport = crate::transport::LedgerTransport::open()?;
+    Ok(crate::ledger_client::LedgerClient::new(transport))
 }
 
 /// Connect to a Ledger app running on Speculos emulator.

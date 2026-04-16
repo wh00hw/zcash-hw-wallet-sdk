@@ -46,6 +46,10 @@ pub enum MsgType {
     TxOutputAck = 0x09,
     /// Abort the signing session
     Abort = 0x0A,
+    /// Send a transparent input for on-device transparent digest computation (v3)
+    TxTransparentInput = 0x0B,
+    /// Send a transparent output for on-device transparent digest computation (v3)
+    TxTransparentOutput = 0x0C,
 }
 
 impl MsgType {
@@ -61,6 +65,8 @@ impl MsgType {
             0x08 => Some(Self::TxOutput),
             0x09 => Some(Self::TxOutputAck),
             0x0A => Some(Self::Abort),
+            0x0B => Some(Self::TxTransparentInput),
+            0x0C => Some(Self::TxTransparentOutput),
             _ => None,
         }
     }
@@ -84,6 +90,8 @@ pub enum ErrorCode {
     SighashMismatch = 0x09,
     /// Unexpected message in current protocol state (v2)
     InvalidState = 0x0A,
+    /// Device-computed transparent digest does not match companion's (v3)
+    TransparentDigestMismatch = 0x0B,
 }
 
 impl ErrorCode {
@@ -99,6 +107,7 @@ impl ErrorCode {
             0x08 => Self::UnsupportedVersion,
             0x09 => Self::SighashMismatch,
             0x0A => Self::InvalidState,
+            0x0B => Self::TransparentDigestMismatch,
             _ => Self::Unknown,
         }
     }
@@ -332,6 +341,104 @@ impl<T: Transport> HwpCodec<T> {
         }
     }
 
+    /// Send a transparent input for on-device digest computation (v3).
+    ///
+    /// Same framing as `send_tx_output` but uses `TxTransparentInput` message type.
+    ///
+    /// # Payload format
+    /// `[input_index:2 LE][total_inputs:2 LE][input_data:N]`
+    ///
+    /// The sentinel message (index == total) carries the 32-byte expected digest.
+    pub fn send_transparent_input(
+        &mut self,
+        input_index: u16,
+        total_inputs: u16,
+        input_data: &[u8],
+    ) -> Result<()> {
+        let mut payload = Vec::with_capacity(4 + input_data.len());
+        payload.extend_from_slice(&input_index.to_le_bytes());
+        payload.extend_from_slice(&total_inputs.to_le_bytes());
+        payload.extend_from_slice(input_data);
+        let seq = self.next_seq();
+        self.write_frame(seq, MsgType::TxTransparentInput, &payload)?;
+
+        // Wait for ACK or error
+        let mut keepalive_count = 0usize;
+        loop {
+            let frame = self.read_frame()?;
+            match frame.msg_type {
+                MsgType::Ping => {
+                    keepalive_count += 1;
+                    if keepalive_count > HWP_MAX_KEEPALIVE {
+                        return Err(HwSignerError::MaxKeepaliveExceeded {
+                            max: HWP_MAX_KEEPALIVE,
+                        });
+                    }
+                    self.write_frame(frame.seq, MsgType::Pong, &[])?;
+                    continue;
+                }
+                MsgType::TxOutputAck => return Ok(()),
+                MsgType::Error => {
+                    let (code, msg) = parse_error(&frame.payload);
+                    return Err(device_error(code, &msg));
+                }
+                other => {
+                    return Err(HwSignerError::ProtocolError(format!(
+                        "Expected TX_OUTPUT_ACK, got {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Send a transparent output for on-device digest computation (v3).
+    ///
+    /// # Payload format
+    /// `[output_index:2 LE][total_outputs:2 LE][output_data:N]`
+    pub fn send_transparent_output(
+        &mut self,
+        output_index: u16,
+        total_outputs: u16,
+        output_data: &[u8],
+    ) -> Result<()> {
+        let mut payload = Vec::with_capacity(4 + output_data.len());
+        payload.extend_from_slice(&output_index.to_le_bytes());
+        payload.extend_from_slice(&total_outputs.to_le_bytes());
+        payload.extend_from_slice(output_data);
+        let seq = self.next_seq();
+        self.write_frame(seq, MsgType::TxTransparentOutput, &payload)?;
+
+        // Wait for ACK or error
+        let mut keepalive_count = 0usize;
+        loop {
+            let frame = self.read_frame()?;
+            match frame.msg_type {
+                MsgType::Ping => {
+                    keepalive_count += 1;
+                    if keepalive_count > HWP_MAX_KEEPALIVE {
+                        return Err(HwSignerError::MaxKeepaliveExceeded {
+                            max: HWP_MAX_KEEPALIVE,
+                        });
+                    }
+                    self.write_frame(frame.seq, MsgType::Pong, &[])?;
+                    continue;
+                }
+                MsgType::TxOutputAck => return Ok(()),
+                MsgType::Error => {
+                    let (code, msg) = parse_error(&frame.payload);
+                    return Err(device_error(code, &msg));
+                }
+                other => {
+                    return Err(HwSignerError::ProtocolError(format!(
+                        "Expected TX_OUTPUT_ACK, got {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+    }
+
     // ── Low-level frame I/O ──────────────────────────────────────────
 
     fn next_seq(&mut self) -> u8 {
@@ -531,6 +638,7 @@ fn device_error(code: ErrorCode, msg: &str) -> HwSignerError {
             action_idx: 0,
             reason: "Device-computed sighash does not match companion sighash".into(),
         },
+        ErrorCode::TransparentDigestMismatch => HwSignerError::TransparentSighashMismatch,
         _ => HwSignerError::DeviceError(format!("{:?}: {}", code, msg)),
     }
 }
