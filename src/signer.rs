@@ -29,7 +29,7 @@ use crate::traits::HardwareSigner;
 use crate::transport::Transport;
 use crate::types::{
     ActionData, ExportedFvk, SignRequest, SignResponse, TransparentInputData,
-    TransparentOutputData, TxDetails, TxMeta,
+    TransparentOutputData, TransparentSignRequest, TransparentSignResponse, TxDetails, TxMeta,
 };
 
 use tracing::{debug, info};
@@ -163,6 +163,26 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
         info!("ZIP-244 sighash verified — device confirmed match.");
 
         Ok(())
+    }
+
+    fn sign_transparent_input(
+        &mut self,
+        request: &TransparentSignRequest,
+        input_data: &TransparentInputData,
+    ) -> Result<TransparentSignResponse> {
+        info!(
+            "Sending transparent sign request (input {}/{})",
+            request.input_index + 1,
+            request.total_inputs,
+        );
+
+        let response = self.codec.sign_transparent(
+            request.input_index as u16,
+            request.total_inputs as u16,
+            &input_data.serialize(),
+        )?;
+        info!("Transparent signature received from device.");
+        Ok(response)
     }
 
     fn verify_transparent_digest(

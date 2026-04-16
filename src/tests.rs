@@ -195,12 +195,12 @@ fn test_parse_error_with_message() {
 
 #[test]
 fn test_msg_type_roundtrip() {
-    for v in 0x01..=0x0Cu8 {
+    for v in 0x01..=0x0Eu8 {
         let mt = MsgType::from_u8(v).unwrap();
         assert_eq!(mt as u8, v);
     }
     assert!(MsgType::from_u8(0x00).is_none());
-    assert!(MsgType::from_u8(0x0D).is_none());
+    assert!(MsgType::from_u8(0x0F).is_none());
 }
 
 #[test]

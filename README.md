@@ -15,7 +15,7 @@
 >
 > If you are interested in sponsoring or conducting an audit, please open an issue.
 
-Transport-agnostic Rust SDK for signing Zcash Orchard shielded transactions via hardware wallets using the [PCZT](https://zips.z.cash/zip-0320) (Partially Created Zcash Transaction) standard.
+Transport-agnostic Rust SDK for signing Zcash Orchard shielded + Transparent transactions via hardware wallets using the [PCZT](https://zips.z.cash/zip-0320) (Partially Created Zcash Transaction) standard.
 
 ## The Problem
 
@@ -23,7 +23,7 @@ Zcash Orchard has no standardized way for hardware wallets to participate in shi
 
 ## The Insight
 
-The **only** operation that requires the spending key (`ask`) is the RedPallas spend authorization signature (~5 seconds on a microcontroller). Everything else — proof generation, blockchain sync, transaction construction — can be done with the full viewing key alone. PCZT is the ideal vehicle for this split because it already models multi-party transaction construction.
+The **only** operations that require spending keys are the RedPallas spend authorization signature (Orchard, ~5 seconds on a microcontroller) and the ECDSA signature (Transparent, ~200ms). Everything else — proof generation, blockchain sync, transaction construction — can be done with the full viewing key alone. PCZT is the ideal vehicle for this split because it already models multi-party transaction construction.
 
 This SDK adds the **hardware signer role** to the PCZT ecosystem.
 
@@ -284,6 +284,10 @@ Binary framed protocol designed for constrained devices.
 | `TxOutput` | 0x08 | Host -> Device | Individual output for incremental hashing (v2) |
 | `TxOutputAck` | 0x09 | Device -> Host | Output hash acknowledged (v2) |
 | `Abort` | 0x0A | Host -> Device | Cancel signing session |
+| `TxTransparentInput` | 0x0B | Host -> Device | Transparent input for on-device digest verification (v3) |
+| `TxTransparentOutput` | 0x0C | Host -> Device | Transparent output for on-device digest verification (v3) |
+| `TransparentSignReq` | 0x0D | Host -> Device | Sign transparent input (ECDSA secp256k1, v3) |
+| `TransparentSignRsp` | 0x0E | Device -> Host | DER signature + sighash_type + compressed pubkey (v3) |
 
 **FVK_REQ payload:**
 
@@ -324,6 +328,7 @@ Three types of TxOutput messages are used for v2 sighash verification:
 | 0x08 | `UnsupportedVersion` | Protocol version not supported |
 | 0x09 | `SighashMismatch` | Device-computed sighash differs from companion (v2) |
 | 0x0A | `InvalidState` | Unexpected message in current state (v2) |
+| 0x0B | `TransparentDigestMismatch` | Device-computed transparent digest differs from companion (v3) |
 
 ### `verify` -- Signature Verification
 
@@ -496,6 +501,8 @@ This means a compromised companion **cannot** trick the device into signing an a
 | **RK binding** | Each signature is bound to a specific action via the randomized verification key. | Active |
 | **CRC-16 framing** | Detects corrupted data on the wire. Auto-retries on CRC errors. | Active |
 | **ZIP-244 sighash verification (v2)** | Device independently computes the full ZIP-244 sighash from transaction data and refuses to sign on mismatch. | Active (via `DeviceSigner`) |
+| **Transparent digest verification (v3)** | Device computes transparent txid digest from raw inputs/outputs and verifies it matches TxMeta. Prevents forged transparent digests. | Active (via `DeviceSigner`) |
+| **Transparent per-input sighash (v3)** | Device computes per-input transparent sighash on-device (amounts, scripts, txin_sig digests) and signs with ECDSA secp256k1. | Active (via `DeviceSigner`) |
 
 **Protocol hardening:**
 
@@ -509,7 +516,7 @@ This means a compromised companion **cannot** trick the device into signing an a
 
 - The device computes the full ZIP-244 sighash independently. A compromised companion cannot forge a valid sighash without providing the correct transaction data.
 - The SDK trusts the PCZT input (produced by `zcash_client_backend`). A compromised wallet could produce a malicious PCZT — but the device will only sign if the sighash matches the action data it received.
-- Currently only Orchard-only transactions are supported for on-device verification. Transactions with transparent or Sapling components would require extending the protocol to send those digests.
+- Orchard and Transparent transactions have full on-device verification. The device computes both the shielded sighash (from Orchard actions) and the transparent digest (from raw inputs/outputs). Sapling digest verification would require extending the protocol further.
 - The SDK does not address physical security of the device (no secure element, no tamper resistance). That's the device manufacturer's responsibility.
 
 ## Integration with the Zcash Ecosystem
@@ -560,11 +567,13 @@ The companion library [**libzcash-orchard-c**](https://github.com/wh00hw/libzcas
 
 It includes:
 
-- **ZIP-244 sighash computation** — full shielded sighash with all BLAKE2b personalizations, enabling on-device transaction verification
+- **ZIP-244 sighash computation** — full shielded sighash with all BLAKE2b personalizations + transparent per-input sighash (amounts, scripts, txin_sig digests), enabling complete on-device transaction verification
 - **ZIP-32 key derivation** (spending key, full viewing key, addresses)
-- **Pallas / RedPallas** curve arithmetic and spend authorization signing
+- **BIP-32 transparent key derivation** — `m / 44' / coin_type' / 0' / 0 / 0` for secp256k1 spending keys
+- **Pallas / RedPallas** curve arithmetic and spend authorization signing (Orchard)
+- **secp256k1 / ECDSA** — curve arithmetic (constant-time Montgomery ladder), ECDSA signing with RFC 6979, DER encoding (Transparent)
 - **Orchard Unified Address** generation with F4Jumble (ZIP-316) and Bech32m
-- **HWP v2 protocol** implementation (matching this SDK's host-side protocol)
+- **HWP v2/v3 protocol** implementation (matching this SDK's host-side protocol)
 - **Crypto primitives**: BLAKE2b, SHA-256/512, HMAC, PBKDF2, AES-256 (FF1)
 - **BIP39** mnemonic generation
 - **Zero external dependencies** — portable to any platform with a C11 compiler
@@ -590,6 +599,7 @@ Once a new pczt release is published, the `[patch.crates-io]` section in `Cargo.
 | `pczt` | 0.5 | PCZT roles (prover, signer, extractor) |
 | `orchard` | 0.12 | Orchard circuit proving/verifying keys |
 | `reddsa` | 0.5 | RedPallas signature verification |
+| `secp256k1` | 0.29 | ECDSA transparent signature parsing |
 | `ff` | 0.13 | Finite field traits (alpha serialization) |
 | `zeroize` | 1 | Secure memory erasure for sensitive data |
 | `subtle` | 2 | Constant-time cryptographic comparisons |
@@ -602,11 +612,14 @@ Once a new pczt release is published, the `[patch.crates-io]` section in `Cargo.
 
 - [x] **On-device ZIP-244 sighash verification** — Device independently computes the full ZIP-244 sighash from transaction metadata + action data and verifies it matches.
 - [x] **Network discrimination** — `coin_type` in FvkReq and TxMeta enables mainnet/testnet selection, with device-side validation.
-- [x] **Integration tests** — Virtual HWP device (C/TCP) + 14 end-to-end Rust tests, running in GitHub Actions on every push.
+- [x] **Integration tests** — Virtual HWP device (C/TCP) + 17 end-to-end Rust tests (Orchard + Transparent), running in GitHub Actions on every push.
+- [x] **Transparent digest verification (v3)** — Device independently computes transparent txid digest from raw inputs/outputs and refuses to sign on mismatch. Prevents forged transparent digests from compromised companions.
+- [x] **Transparent per-input signing (v3)** — Device computes per-input transparent sighash on-device (ZIP-244 S.2: amounts, scripts, txin_sig digests) and signs with ECDSA secp256k1 via BIP-32 derived keys.
+- [x] **Transparent sighash hardening** — Integrated librustzcash PR #2278: `SignableInput::from_parts` validates input index at construction time, preventing out-of-range index attacks.
 - [ ] **Upstream pczt release** — The SDK depends on librustzcash `main` (git submodule + `[patch.crates-io]`) for the external signing APIs. A new pczt crates.io release would remove this dependency.
 - [ ] **External security audit** — Required before any production/mainnet use
 - [ ] **QR transport testing** — The QR transport is untested with real hardware. Needs end-to-end validation with an air-gapped device.
-- [ ] **Hardware wallet reference firmware** — Demonstrator device firmware for ESP32 or similar
+- [ ] **Sapling support** — Sapling signing requires Jubjub/RedJubjub on device + Groth16 prover on host. Roadmap in `docs/plan-sapling-transparent.md`.
 
 ## License
 

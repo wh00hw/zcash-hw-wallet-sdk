@@ -80,3 +80,8 @@ int wallet_test_sign(const OrchardSignerCtx *ctx,
     fprintf(stderr, "[wallet] Sign OK\n");
     return 0;
 }
+
+void wallet_test_get_seed(uint8_t seed_out[64])
+{
+    memcpy(seed_out, zip32_seed, 64);
+}

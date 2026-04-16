@@ -13,7 +13,8 @@ use zcash_hw_wallet_sdk::signer::DeviceSigner;
 use zcash_hw_wallet_sdk::traits::HardwareSigner;
 use zcash_hw_wallet_sdk::transport::{TcpTransport, Transport};
 use zcash_hw_wallet_sdk::types::{
-    ActionData, SignRequest, TxMeta, COIN_TYPE_MAINNET, COIN_TYPE_TESTNET,
+    ActionData, SignRequest, TransparentInputData, TransparentOutputData, TxMeta,
+    COIN_TYPE_MAINNET, COIN_TYPE_TESTNET,
 };
 
 /// Expected FVK components for coin_type=133 (mainnet), "abandon...about" mnemonic.
@@ -508,4 +509,246 @@ fn test_reconnect_clean_session() {
             .expect("FVK 2 failed");
         assert_eq!(fvk.ak, EXPECTED_AK, "FVK should match after reconnect");
     }
+}
+
+// ── Transparent helpers ─────────────────────────────────────────────
+
+/// Write a CompactSize-encoded length (Bitcoin-style variable-length integer).
+fn compact_size(val: usize) -> Vec<u8> {
+    if val < 253 {
+        vec![val as u8]
+    } else if val <= 0xFFFF {
+        let mut buf = vec![0xFD];
+        buf.extend_from_slice(&(val as u16).to_le_bytes());
+        buf
+    } else {
+        let mut buf = vec![0xFE];
+        buf.extend_from_slice(&(val as u32).to_le_bytes());
+        buf
+    }
+}
+
+/// Build synthetic transparent input data for testing.
+fn build_test_transparent_input(index: u8) -> TransparentInputData {
+    TransparentInputData {
+        prevout_hash: [0x10 + index; 32],
+        prevout_index: index as u32,
+        sequence: 0xFFFFFFFF,
+        value: 50_000 * (index as u64 + 1),
+        // P2PKH script_pubkey: OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+        script_pubkey: {
+            let mut s = vec![0x76, 0xA9, 0x14]; // OP_DUP OP_HASH160 PUSH20
+            s.extend_from_slice(&[0x20 + index; 20]); // fake pubkey hash
+            s.extend_from_slice(&[0x88, 0xAC]); // OP_EQUALVERIFY OP_CHECKSIG
+            s
+        },
+    }
+}
+
+/// Build synthetic transparent output data for testing.
+fn build_test_transparent_output(index: u8) -> TransparentOutputData {
+    TransparentOutputData {
+        value: 40_000 * (index as u64 + 1),
+        script_pubkey: {
+            let mut s = vec![0x76, 0xA9, 0x14];
+            s.extend_from_slice(&[0x80 + index; 20]);
+            s.extend_from_slice(&[0x88, 0xAC]);
+            s
+        },
+    }
+}
+
+/// Compute the ZIP-244 transparent txid digest from inputs and outputs (Rust-side).
+/// Must produce the same result as the C library's zip244_transparent_digest().
+fn compute_transparent_digest(
+    inputs: &[TransparentInputData],
+    outputs: &[TransparentOutputData],
+) -> [u8; 32] {
+    // prevouts_digest = BLAKE2b-256("ZTxIdPrevoutHash", for each: prevout_hash[32] || prevout_index[4 LE])
+    let mut prevouts = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZTxIdPrevoutHash")
+        .to_state();
+    for inp in inputs {
+        prevouts.update(&inp.prevout_hash);
+        prevouts.update(&inp.prevout_index.to_le_bytes());
+    }
+    let prevouts_digest: [u8; 32] = prevouts.finalize().as_bytes().try_into().unwrap();
+
+    // sequence_digest = BLAKE2b-256("ZTxIdSequencHash", for each: sequence[4 LE])
+    let mut sequences = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZTxIdSequencHash")
+        .to_state();
+    for inp in inputs {
+        sequences.update(&inp.sequence.to_le_bytes());
+    }
+    let sequence_digest: [u8; 32] = sequences.finalize().as_bytes().try_into().unwrap();
+
+    // outputs_digest = BLAKE2b-256("ZTxIdOutputsHash", for each: value[8 LE] || CompactSize(script_len) || script)
+    let mut outputs_h = blake2b_simd::Params::new()
+        .hash_length(32)
+        .personal(b"ZTxIdOutputsHash")
+        .to_state();
+    for out in outputs {
+        outputs_h.update(&(out.value as i64).to_le_bytes());
+        outputs_h.update(&compact_size(out.script_pubkey.len()));
+        outputs_h.update(&out.script_pubkey);
+    }
+    let outputs_digest: [u8; 32] = outputs_h.finalize().as_bytes().try_into().unwrap();
+
+    // transparent_digest = BLAKE2b-256("ZTxIdTranspaHash", prevouts || sequences || outputs)
+    let mut root_input = Vec::new();
+    root_input.extend_from_slice(&prevouts_digest);
+    root_input.extend_from_slice(&sequence_digest);
+    root_input.extend_from_slice(&outputs_digest);
+
+    blake2b_personal(b"ZTxIdTranspaHash", &root_input)
+}
+
+// ── Group 8: Transparent Digest Verification (v3) ───────────────────
+
+#[test]
+fn test_transparent_digest_valid() {
+    let mut codec = connect_codec();
+    codec.request_fvk(COIN_TYPE_MAINNET).expect("FVK failed");
+
+    let inputs = vec![build_test_transparent_input(0), build_test_transparent_input(1)];
+    let outputs = vec![build_test_transparent_output(0)];
+    let digest = compute_transparent_digest(&inputs, &outputs);
+
+    // Build TxMeta with the correct transparent_sig_digest
+    let mut meta = build_test_tx_meta(COIN_TYPE_MAINNET);
+    meta.transparent_sig_digest = digest;
+
+    // Send metadata first (enters RECEIVING_ACTIONS state)
+    let meta_bytes = meta.serialize();
+    codec
+        .send_tx_output(0xFFFF, 1, &meta_bytes)
+        .expect("TxMeta send failed");
+
+    // Send transparent inputs
+    for (i, inp) in inputs.iter().enumerate() {
+        codec
+            .send_transparent_input(i as u16, inputs.len() as u16, &inp.serialize())
+            .expect(&format!("Transparent input {} failed", i));
+    }
+
+    // Send transparent outputs
+    for (i, out) in outputs.iter().enumerate() {
+        codec
+            .send_transparent_output(i as u16, outputs.len() as u16, &out.serialize())
+            .expect(&format!("Transparent output {} failed", i));
+    }
+
+    // Send sentinel with expected digest
+    codec
+        .send_transparent_input(inputs.len() as u16, inputs.len() as u16, &digest)
+        .expect("Transparent digest verification failed — Rust and C computed different digest!");
+}
+
+#[test]
+fn test_transparent_digest_mismatch() {
+    let mut codec = connect_codec();
+    codec.request_fvk(COIN_TYPE_MAINNET).expect("FVK failed");
+
+    let inputs = vec![build_test_transparent_input(0)];
+    let outputs = vec![build_test_transparent_output(0)];
+    let digest = compute_transparent_digest(&inputs, &outputs);
+
+    let mut meta = build_test_tx_meta(COIN_TYPE_MAINNET);
+    meta.transparent_sig_digest = digest;
+
+    let meta_bytes = meta.serialize();
+    codec
+        .send_tx_output(0xFFFF, 1, &meta_bytes)
+        .expect("TxMeta send failed");
+
+    // Send the input correctly
+    codec
+        .send_transparent_input(0, 1, &inputs[0].serialize())
+        .expect("Transparent input failed");
+
+    // Send the output correctly
+    codec
+        .send_transparent_output(0, 1, &outputs[0].serialize())
+        .expect("Transparent output failed");
+
+    // Send WRONG digest as sentinel
+    let bad_digest = [0xFF; 32];
+    let result = codec.send_transparent_input(1, 1, &bad_digest);
+    assert!(
+        result.is_err(),
+        "Wrong transparent digest should be rejected"
+    );
+}
+
+#[test]
+fn test_transparent_digest_then_orchard_sighash() {
+    let mut codec = connect_codec();
+    codec.request_fvk(COIN_TYPE_MAINNET).expect("FVK failed");
+
+    // Build transparent data
+    let inputs = vec![build_test_transparent_input(0)];
+    let outputs = vec![build_test_transparent_output(0)];
+    let transparent_digest = compute_transparent_digest(&inputs, &outputs);
+
+    // Build TxMeta with the real transparent digest
+    let mut meta = build_test_tx_meta(COIN_TYPE_MAINNET);
+    meta.transparent_sig_digest = transparent_digest;
+
+    // Build Orchard action
+    let action = build_test_action_data();
+    let sighash = compute_zip244_sighash(&meta, &[action.clone()]);
+
+    // 1. Send metadata
+    let meta_bytes = meta.serialize();
+    codec
+        .send_tx_output(0xFFFF, 1, &meta_bytes)
+        .expect("TxMeta send failed");
+
+    // 2. Transparent verification: inputs → outputs → sentinel
+    codec
+        .send_transparent_input(0, 1, &inputs[0].serialize())
+        .expect("Transparent input failed");
+    codec
+        .send_transparent_output(0, 1, &outputs[0].serialize())
+        .expect("Transparent output failed");
+    codec
+        .send_transparent_input(1, 1, &transparent_digest)
+        .expect("Transparent digest verification failed");
+
+    // 3. Orchard action data
+    codec
+        .send_tx_output(0, 1, &action.serialize())
+        .expect("Action send failed");
+
+    // 4. Sighash sentinel
+    codec
+        .send_tx_output(1, 1, &sighash)
+        .expect("Sighash verification failed after transparent — full flow broken!");
+
+    // 5. Sign — proves the full transparent+orchard flow is coherent
+    let sign_req = SignRequest {
+        sighash,
+        alpha: [0x42; 32],
+        amount: 50000,
+        fee: 10000,
+        recipient: "u1test".to_string(),
+        action_index: 0,
+        total_actions: 1,
+    };
+    let response = codec.sign(&sign_req).expect("Signing failed after transparent verification");
+
+    assert_ne!(response.signature, [0u8; 64], "Signature should be non-zero");
+    assert_ne!(response.rk, [0u8; 32], "rk should be non-zero");
+
+    // Verify signature cryptographically
+    let rk_vk = reddsa::VerificationKey::<reddsa::orchard::SpendAuth>::try_from(response.rk)
+        .expect("rk should be valid");
+    let sig = reddsa::Signature::<reddsa::orchard::SpendAuth>::from(response.signature);
+    assert!(
+        rk_vk.verify(&sighash, &sig).is_ok(),
+        "Signature should verify — full transparent+orchard flow must be coherent"
+    );
 }

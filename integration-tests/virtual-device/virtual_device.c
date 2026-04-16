@@ -12,6 +12,9 @@
 #include <signal.h>
 #include "hwp.h"
 #include "orchard_signer.h"
+#include "secp256k1.h"
+#include "bip32.h"
+#include "memzero.h"
 #include "tcp_transport.h"
 #include "wallet_test.h"
 
@@ -174,6 +177,174 @@ static void handle_sign_req(int fd, uint8_t seq, const uint8_t *payload, uint16_
     fprintf(stderr, "[hwp] SIGN_RSP sent\n");
 }
 
+/* ── Transparent digest verification handlers (v3) ─────────────── */
+
+static void handle_transparent_input(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload_len < HWP_TX_OUTPUT_HEADER) {
+        send_error(fd, seq, HWP_ERR_BAD_FRAME, "transparent input too short");
+        return;
+    }
+
+    uint16_t input_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    uint16_t total_inputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    const uint8_t *data   = payload + HWP_TX_OUTPUT_HEADER;
+    uint16_t data_len     = payload_len - HWP_TX_OUTPUT_HEADER;
+
+    OrchardSignerError serr;
+
+    /* First transparent input triggers begin_transparent on the signer */
+    if (input_index == 0 && signer_ctx.state == SIGNER_RECEIVING_ACTIONS) {
+        serr = orchard_signer_begin_transparent(&signer_ctx, total_inputs, 0);
+        if (serr != SIGNER_OK) {
+            send_error(fd, seq, HWP_ERR_INVALID_STATE, "cannot begin transparent");
+            orchard_signer_reset(&signer_ctx);
+            return;
+        }
+        fprintf(stderr, "[hwp] Transparent verification started (%d inputs)\n", total_inputs);
+    }
+
+    /* Sentinel: index == total_inputs → verify digest */
+    if (input_index == total_inputs) {
+        if (data_len != 32) {
+            send_error(fd, seq, HWP_ERR_BAD_FRAME, "transparent sentinel must be 32 bytes");
+            orchard_signer_reset(&signer_ctx);
+            return;
+        }
+
+        serr = orchard_signer_verify_transparent(&signer_ctx, data);
+        if (serr == SIGNER_ERR_TRANSPARENT_MISMATCH) {
+            fprintf(stderr, "[hwp] Transparent digest MISMATCH\n");
+            send_error(fd, seq, HWP_ERR_TRANSPARENT_DIGEST_MISMATCH, "transparent digest mismatch");
+            return;
+        }
+        if (serr != SIGNER_OK) {
+            fprintf(stderr, "[hwp] Transparent verify failed (err=%d)\n", serr);
+            send_error(fd, seq, HWP_ERR_INVALID_STATE, "transparent verify failed");
+            orchard_signer_reset(&signer_ctx);
+            return;
+        }
+
+        fprintf(stderr, "[hwp] Transparent digest verified\n");
+        send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+        return;
+    }
+
+    /* Normal input data */
+    serr = orchard_signer_feed_transparent_input(&signer_ctx, data, data_len);
+    if (serr != SIGNER_OK) {
+        const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected transparent input" : "invalid transparent input";
+        HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME;
+        send_error(fd, seq, code, msg);
+        orchard_signer_reset(&signer_ctx);
+        return;
+    }
+
+    fprintf(stderr, "[hwp] Transparent input %d/%d hashed\n", input_index + 1, total_inputs);
+    send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+}
+
+static void handle_transparent_output(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload_len < HWP_TX_OUTPUT_HEADER) {
+        send_error(fd, seq, HWP_ERR_BAD_FRAME, "transparent output too short");
+        return;
+    }
+
+    uint16_t output_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    uint16_t total_outputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    const uint8_t *data    = payload + HWP_TX_OUTPUT_HEADER;
+    uint16_t data_len      = payload_len - HWP_TX_OUTPUT_HEADER;
+
+    /* Set the expected outputs count on first output message */
+    if (output_index == 0 && signer_ctx.transparent_outputs_expected == 0) {
+        signer_ctx.transparent_outputs_expected = total_outputs;
+        fprintf(stderr, "[hwp] Expecting %d transparent outputs\n", total_outputs);
+    }
+
+    OrchardSignerError serr = orchard_signer_feed_transparent_output(&signer_ctx, data, data_len);
+    if (serr != SIGNER_OK) {
+        const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected transparent output" : "invalid transparent output";
+        HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME;
+        send_error(fd, seq, code, msg);
+        orchard_signer_reset(&signer_ctx);
+        return;
+    }
+
+    fprintf(stderr, "[hwp] Transparent output %d/%d hashed\n", output_index + 1, total_outputs);
+    send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+}
+
+static void handle_transparent_sign_req(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
+{
+    if (payload_len < HWP_TX_OUTPUT_HEADER) {
+        send_error(fd, seq, HWP_ERR_BAD_FRAME, "transparent sign req too short");
+        return;
+    }
+
+    uint16_t input_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+    uint16_t total_inputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+    const uint8_t *input_data = payload + HWP_TX_OUTPUT_HEADER;
+    uint16_t input_data_len   = payload_len - HWP_TX_OUTPUT_HEADER;
+
+    fprintf(stderr, "[hwp] TRANSPARENT_SIGN_REQ (input %d/%d)\n", input_index + 1, total_inputs);
+
+    if (!signer_ctx.transparent_verified) {
+        send_error(fd, seq, HWP_ERR_INVALID_STATE, "transparent not verified");
+        return;
+    }
+
+    /* Compute per-input transparent sighash on-device */
+    uint8_t per_input_sighash[32];
+    zip244_transparent_per_input_sighash(
+        &signer_ctx.transparent_state,
+        input_index,
+        input_data,
+        input_data_len,
+        0x01, /* SIGHASH_ALL */
+        per_input_sighash);
+
+    /* Derive transparent spending key via BIP-32 */
+    uint32_t coin_type = signer_ctx.coin_type ? signer_ctx.coin_type : 1;
+    uint8_t seed[64];
+    wallet_test_get_seed(seed);
+
+    uint8_t t_sk[32], t_pubkey[33];
+    if (bip32_derive_transparent_sk(seed, coin_type, t_sk, t_pubkey) != 0) {
+        memzero(seed, sizeof(seed));
+        send_error(fd, seq, HWP_ERR_SIGN_FAILED, "BIP-32 derivation failed");
+        return;
+    }
+    memzero(seed, sizeof(seed));
+
+    /* Sign with ECDSA */
+    uint8_t compact_sig[64];
+    if (secp256k1_ecdsa_sign_digest(t_sk, per_input_sighash, compact_sig) != 0) {
+        memzero(t_sk, sizeof(t_sk));
+        send_error(fd, seq, HWP_ERR_SIGN_FAILED, "ECDSA signing failed");
+        return;
+    }
+    memzero(t_sk, sizeof(t_sk));
+
+    /* DER encode */
+    uint8_t der_sig[72];
+    size_t der_len = secp256k1_sig_to_der(compact_sig, der_sig);
+
+    /* Build response: der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33] */
+    uint8_t rsp[HWP_TRANSPARENT_SIGN_RSP_MAX];
+    rsp[0] = (uint8_t)der_len;
+    memcpy(rsp + 1, der_sig, der_len);
+    rsp[1 + der_len] = 0x01; /* SIGHASH_ALL */
+    memcpy(rsp + 1 + der_len + 1, t_pubkey, 33);
+
+    size_t rsp_len = 1 + der_len + 1 + 33;
+    send_frame(fd, seq, HWP_MSG_TRANSPARENT_SIGN_RSP, rsp, (uint16_t)rsp_len);
+
+    fprintf(stderr, "[hwp] TRANSPARENT_SIGN_RSP sent (DER %zu bytes)\n", der_len);
+    memzero(compact_sig, sizeof(compact_sig));
+    memzero(per_input_sighash, sizeof(per_input_sighash));
+}
+
 static void handle_abort(void)
 {
     if (signer_ctx.state != SIGNER_IDLE) {
@@ -241,6 +412,15 @@ int main(int argc, char *argv[])
                 break;
             case HWP_MSG_ABORT:
                 handle_abort();
+                break;
+            case HWP_MSG_TX_TRANSPARENT_INPUT:
+                handle_transparent_input(client_fd, f->seq, f->payload, f->payload_len);
+                break;
+            case HWP_MSG_TX_TRANSPARENT_OUTPUT:
+                handle_transparent_output(client_fd, f->seq, f->payload, f->payload_len);
+                break;
+            case HWP_MSG_TRANSPARENT_SIGN_REQ:
+                handle_transparent_sign_req(client_fd, f->seq, f->payload, f->payload_len);
                 break;
             default:
                 send_error(client_fd, f->seq, HWP_ERR_UNKNOWN, "unsupported msg type");

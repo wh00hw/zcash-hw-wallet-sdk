@@ -97,13 +97,18 @@ pub trait HardwareSigner {
     ///
     /// Unlike Orchard/Sapling where the shielded sighash is shared across all
     /// spends, transparent has a **per-input sighash** that commits to the
-    /// specific input's script and value.
+    /// specific input's script and value. The device computes this sighash
+    /// on-device from its stored transparent state + the input data.
+    ///
+    /// The `input_data` contains the full wire-format input for on-device
+    /// txin_sig_digest computation.
     ///
     /// The default implementation returns `UnsupportedPool` — Orchard-only
     /// devices don't need to implement this.
     fn sign_transparent_input(
         &mut self,
         _request: &TransparentSignRequest,
+        _input_data: &TransparentInputData,
     ) -> Result<TransparentSignResponse> {
         Err(HwSignerError::UnsupportedPool("transparent"))
     }

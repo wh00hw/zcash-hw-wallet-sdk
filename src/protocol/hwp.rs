@@ -50,6 +50,10 @@ pub enum MsgType {
     TxTransparentInput = 0x0B,
     /// Send a transparent output for on-device transparent digest computation (v3)
     TxTransparentOutput = 0x0C,
+    /// Sign a transparent input (ECDSA secp256k1, v3)
+    TransparentSignReq = 0x0D,
+    /// Transparent signature response (v3)
+    TransparentSignRsp = 0x0E,
 }
 
 impl MsgType {
@@ -67,6 +71,8 @@ impl MsgType {
             0x0A => Some(Self::Abort),
             0x0B => Some(Self::TxTransparentInput),
             0x0C => Some(Self::TxTransparentOutput),
+            0x0D => Some(Self::TransparentSignReq),
+            0x0E => Some(Self::TransparentSignRsp),
             _ => None,
         }
     }
@@ -334,6 +340,83 @@ impl<T: Transport> HwpCodec<T> {
                 other => {
                     return Err(HwSignerError::ProtocolError(format!(
                         "Expected TX_OUTPUT_ACK, got {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Send a transparent signing request to the device (v3).
+    ///
+    /// The device computes the per-input sighash on-device from its stored
+    /// transparent state + the input data, then signs with ECDSA secp256k1.
+    ///
+    /// # Payload format
+    /// `[input_index:2 LE][total_inputs:2 LE][input_data:N]`
+    ///
+    /// # Response
+    /// `[der_sig_len:1][der_sig:N][sighash_type:1][pubkey:33]`
+    pub fn sign_transparent(
+        &mut self,
+        input_index: u16,
+        total_inputs: u16,
+        input_data: &[u8],
+    ) -> Result<crate::types::TransparentSignResponse> {
+        let mut payload = Vec::with_capacity(4 + input_data.len());
+        payload.extend_from_slice(&input_index.to_le_bytes());
+        payload.extend_from_slice(&total_inputs.to_le_bytes());
+        payload.extend_from_slice(input_data);
+        let seq = self.next_seq();
+        self.write_frame(seq, MsgType::TransparentSignReq, &payload)?;
+
+        let mut keepalive_count = 0usize;
+        loop {
+            let frame = self.read_frame()?;
+            match frame.msg_type {
+                MsgType::Ping => {
+                    keepalive_count += 1;
+                    if keepalive_count > HWP_MAX_KEEPALIVE {
+                        return Err(HwSignerError::MaxKeepaliveExceeded {
+                            max: HWP_MAX_KEEPALIVE,
+                        });
+                    }
+                    self.write_frame(frame.seq, MsgType::Pong, &[])?;
+                    continue;
+                }
+                MsgType::TransparentSignRsp => {
+                    // Parse: der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33]
+                    if frame.payload.is_empty() {
+                        return Err(HwSignerError::ProtocolError(
+                            "TRANSPARENT_SIGN_RSP empty".into(),
+                        ));
+                    }
+                    let der_len = frame.payload[0] as usize;
+                    let min_len = 1 + der_len + 1 + 33;
+                    if frame.payload.len() < min_len {
+                        return Err(HwSignerError::ProtocolError(format!(
+                            "TRANSPARENT_SIGN_RSP too short: {} < {}",
+                            frame.payload.len(),
+                            min_len
+                        )));
+                    }
+                    let mut sig = Vec::with_capacity(der_len + 1);
+                    sig.extend_from_slice(&frame.payload[1..1 + der_len]);
+                    let sighash_type = frame.payload[1 + der_len];
+                    sig.push(sighash_type);
+
+                    let mut pubkey = [0u8; 33];
+                    pubkey.copy_from_slice(&frame.payload[1 + der_len + 1..1 + der_len + 1 + 33]);
+
+                    return Ok(crate::types::TransparentSignResponse { signature: sig, pubkey });
+                }
+                MsgType::Error => {
+                    let (code, msg) = parse_error(&frame.payload);
+                    return Err(device_error(code, &msg));
+                }
+                other => {
+                    return Err(HwSignerError::ProtocolError(format!(
+                        "Expected TRANSPARENT_SIGN_RSP, got {:?}",
                         other
                     )));
                 }

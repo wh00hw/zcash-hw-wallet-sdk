@@ -19,3 +19,6 @@ int wallet_test_sign(const OrchardSignerCtx *ctx,
                      const uint8_t sighash[32], const uint8_t alpha[32],
                      uint8_t sig_out[64], uint8_t rk_out[32],
                      uint32_t coin_type);
+
+/** Get the raw 64-byte BIP-39 seed (for BIP-32 transparent derivation). */
+void wallet_test_get_seed(uint8_t seed_out[64]);

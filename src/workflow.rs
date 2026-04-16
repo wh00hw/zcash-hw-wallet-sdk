@@ -354,7 +354,7 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                         script_pubkey: t_inputs[i].script_pubkey().clone(),
                     };
 
-                    let response = self.signer.sign_transparent_input(&request)?;
+                    let response = self.signer.sign_transparent_input(&request, &input_data[i])?;
 
                     // Parse the ECDSA signature and inject into PCZT
                     let ecdsa_sig = secp256k1::ecdsa::Signature::from_der(&response.signature[..response.signature.len().saturating_sub(1)])
