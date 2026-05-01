@@ -96,6 +96,27 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
         pczt_bytes: Vec<u8>,
         details: Option<TxDetails>,
     ) -> Result<SigningResult> {
+        // Step 0: Defense-in-depth Orchard-only invariant check.
+        //
+        // The device enforces that sapling_digest equals the ZIP-244 empty-bundle
+        // constant before signing (SIGNER_ERR_SAPLING_NOT_EMPTY). Reject locally
+        // first so the user gets a clean error instead of round-tripping a PCZT
+        // that the device will reject. Mirrors the on-device invariant: this
+        // signer never produces a transaction with any Sapling component.
+        {
+            let pczt_for_check = pczt::Pczt::parse(&pczt_bytes)
+                .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT parse: {:?}", e)))?;
+            let sapling = pczt_for_check.sapling();
+            let n_spends = sapling.spends().len();
+            let n_outputs = sapling.outputs().len();
+            if n_spends != 0 || n_outputs != 0 {
+                return Err(HwSignerError::SaplingNotSupported {
+                    spends: n_spends,
+                    outputs: n_outputs,
+                });
+            }
+        }
+
         // Step 1: Extract tx metadata for device verification
         // Extract TxMeta from the actual TransactionData (not from PCZT Global)
         // to ensure fields like lock_time match what zcash_primitives uses.

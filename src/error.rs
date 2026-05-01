@@ -52,6 +52,12 @@ pub enum HwSignerError {
     #[error("Unsupported pool: {0}")]
     UnsupportedPool(&'static str),
 
+    #[error(
+        "Sapling components not supported: this is an Orchard-only signer (PCZT has \
+         {spends} sapling spend(s) and {outputs} sapling output(s))"
+    )]
+    SaplingNotSupported { spends: usize, outputs: usize },
+
     #[error("Transparent signature verification failed on input {input_idx}: {reason}")]
     TransparentSignatureVerificationFailed { input_idx: usize, reason: String },
 
