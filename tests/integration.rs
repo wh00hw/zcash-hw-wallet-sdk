@@ -72,7 +72,9 @@ fn build_test_tx_meta(coin_type: u32) -> TxMeta {
     }
 }
 
-/// Build a synthetic 820-byte ActionData for testing.
+/// Build a synthetic v4 ActionData (903 bytes on the wire) for testing.
+/// recipient/value/rseed fields are filler — these tests don't drive the
+/// on-device cmx verification, they exercise framing and ZIP-244 hashing.
 fn build_test_action_data() -> ActionData {
     ActionData {
         cv_net: [0x01; 32],
@@ -82,6 +84,9 @@ fn build_test_action_data() -> ActionData {
         ephemeral_key: [0x05; 32],
         enc_ciphertext: vec![0x06; 580],
         out_ciphertext: vec![0x07; 80],
+        recipient: [0x08; 43],
+        value: 0,
+        rseed: [0x09; 32],
     }
 }
 
@@ -300,6 +305,9 @@ fn test_sighash_multi_action() {
                 ephemeral_key: [fill + 0x40; 32],
                 enc_ciphertext: vec![fill + 0x50; 580],
                 out_ciphertext: vec![fill + 0x60; 80],
+                recipient: [fill + 0x70; 43],
+                value: (i as u64 + 1) * 1_000_000,
+                rseed: [fill + 0x80; 32],
             }
         })
         .collect();

@@ -153,9 +153,17 @@ impl ExportedFvk {
 /// Contains all the fields the device needs to independently compute
 /// the ZIP-244 orchard actions digest and verify the sighash.
 ///
-/// Wire format per action:
-/// `cv_net(32) || nullifier(32) || rk(32) || cmx(32) || ephemeral_key(32) || enc_ciphertext(580) || out_ciphertext(80)`
-/// Total: 820 bytes
+/// Wire format per action (v4):
+/// `cv_net(32) || nullifier(32) || rk(32) || cmx(32) || ephemeral_key(32) ||
+///   enc_ciphertext(580) || out_ciphertext(80) ||
+///   recipient(43) || value(8 LE) || rseed(32)`
+/// Total: 903 bytes
+///
+/// The trailing 83 bytes (recipient/value/rseed) are the unencrypted note plaintext.
+/// They are required so the device can recompute the action's NoteCommitment and
+/// verify it matches the cmx field of the encrypted action — without this, a
+/// hostile companion could swap the recipient between the displayed UI and the
+/// on-chain effect of the signed transaction.
 #[derive(Debug, Clone)]
 pub struct ActionData {
     /// Value commitment (32 bytes).
@@ -172,15 +180,22 @@ pub struct ActionData {
     pub enc_ciphertext: Vec<u8>,
     /// Encrypted outgoing plaintext (80 bytes).
     pub out_ciphertext: Vec<u8>,
+    /// Output-note recipient: raw 43-byte Orchard payment-address encoding (`d || pk_d`).
+    pub recipient: [u8; 43],
+    /// Output-note value (zatoshis).
+    pub value: u64,
+    /// Output-note random seed.
+    pub rseed: [u8; 32],
 }
 
 impl ActionData {
-    /// Serialize to the wire format for TxOutput messages.
-    ///
-    /// Layout: `cv_net(32) || nullifier(32) || rk(32) || cmx(32) || ephemeral_key(32) || enc_ciphertext || out_ciphertext`
+    /// Serialize to the v4 wire format for TxOutput messages (903 bytes).
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            32 + 32 + 32 + 32 + 32 + self.enc_ciphertext.len() + self.out_ciphertext.len(),
+            32 + 32 + 32 + 32 + 32
+                + self.enc_ciphertext.len()
+                + self.out_ciphertext.len()
+                + 43 + 8 + 32,
         );
         buf.extend_from_slice(&self.cv_net);
         buf.extend_from_slice(&self.nullifier);
@@ -189,6 +204,10 @@ impl ActionData {
         buf.extend_from_slice(&self.ephemeral_key);
         buf.extend_from_slice(&self.enc_ciphertext);
         buf.extend_from_slice(&self.out_ciphertext);
+        // v4 note plaintext suffix
+        buf.extend_from_slice(&self.recipient);
+        buf.extend_from_slice(&self.value.to_le_bytes());
+        buf.extend_from_slice(&self.rseed);
         buf
     }
 }

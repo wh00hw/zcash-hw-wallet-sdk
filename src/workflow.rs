@@ -237,6 +237,16 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
         let mut all_actions_data: Vec<ActionData> = Vec::new();
         let mut rk_values: Vec<[u8; 32]> = Vec::new();
 
+        // Re-parse the PCZT once more for raw access to the per-action output
+        // fields (recipient / value / rseed) that the device needs to recompute
+        // the NoteCommitment. low_level_signer hands us the *typed* orchard
+        // bundle (via the `orchard` crate), which exposes nullifier/rk/cmx but
+        // not the unencrypted output note plaintext; that lives on the PCZT
+        // structure itself.
+        let pczt_for_outputs = pczt::Pczt::parse(&pczt_bytes)
+            .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse: {:?}", e)))?;
+        let pczt_actions = pczt_for_outputs.orchard().actions().clone();
+
         let temp_signer = pczt::roles::low_level_signer::Signer::new(pre_pczt);
         let _ = temp_signer
             .sign_orchard_with(|_pczt, bundle, _tx_modifiable| -> std::result::Result<(), HwSignerError> {
@@ -248,6 +258,36 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                         actions_to_sign.push((i, alpha.to_repr()));
                     }
 
+                    // The companion *must* know recipient/value/rseed — without
+                    // them the device cannot verify cmx and we'd be back to the
+                    // recipient-substitution attack the v4 protocol fixes.
+                    // Bail early with a clear error if the PCZT has been
+                    // redacted by an Updater that stripped these fields.
+                    let pczt_output = pczt_actions
+                        .get(i)
+                        .ok_or_else(|| HwSignerError::SignerInitFailed(
+                            format!("PCZT action {} missing", i),
+                        ))?
+                        .output();
+                    let recipient: [u8; 43] = *pczt_output.recipient().as_ref().ok_or_else(|| {
+                        HwSignerError::SignerInitFailed(format!(
+                            "PCZT output {}: missing recipient (required for on-device cmx verification)",
+                            i
+                        ))
+                    })?;
+                    let value: u64 = *pczt_output.value().as_ref().ok_or_else(|| {
+                        HwSignerError::SignerInitFailed(format!(
+                            "PCZT output {}: missing value (required for on-device cmx verification)",
+                            i
+                        ))
+                    })?;
+                    let rseed: [u8; 32] = *pczt_output.rseed().as_ref().ok_or_else(|| {
+                        HwSignerError::SignerInitFailed(format!(
+                            "PCZT output {}: missing rseed (required for on-device cmx verification)",
+                            i
+                        ))
+                    })?;
+
                     let enc_note = action.output().encrypted_note();
                     all_actions_data.push(ActionData {
                         cv_net: action.cv_net().to_bytes(),
@@ -257,6 +297,9 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                         ephemeral_key: enc_note.epk_bytes,
                         enc_ciphertext: enc_note.enc_ciphertext.to_vec(),
                         out_ciphertext: enc_note.out_ciphertext.to_vec(),
+                        recipient,
+                        value,
+                        rseed,
                     });
                 }
                 Ok(())
