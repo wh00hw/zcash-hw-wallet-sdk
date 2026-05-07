@@ -420,8 +420,29 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
 
                     let response = self.signer.sign_transparent_input(&request, &input_data[i])?;
 
-                    // Parse the ECDSA signature and inject into PCZT
-                    let ecdsa_sig = secp256k1::ecdsa::Signature::from_der(&response.signature[..response.signature.len().saturating_sub(1)])
+                    // The DER signature carries a trailing sighash_type byte
+                    // (Bitcoin convention); strip it before parsing the
+                    // ECDSA structure for both verification and PCZT injection.
+                    let der_sig_bytes = &response.signature[..response.signature.len().saturating_sub(1)];
+
+                    // Defence-in-depth host re-verification of the ECDSA
+                    // signature against the host-computed sighash and the
+                    // device-returned pubkey, plus a HASH160 cross-check
+                    // tying that pubkey to the input's P2PKH script_pubkey.
+                    // Mirrors the Orchard verify pattern; closes the gap
+                    // where a buggy or hostile device could return a
+                    // valid-DER but cryptographically wrong signature, or
+                    // sign with the wrong key.
+                    // Audit: docs/security-audit/04-host-sdk-rust.md H2.
+                    crate::verify::verify_transparent_signature(
+                        &t_sighash,
+                        der_sig_bytes,
+                        &response.pubkey,
+                        &request.script_pubkey,
+                        i,
+                    )?;
+
+                    let ecdsa_sig = secp256k1::ecdsa::Signature::from_der(der_sig_bytes)
                         .map_err(|e| HwSignerError::TransparentSignatureVerificationFailed {
                             input_idx: i,
                             reason: format!("Invalid DER signature: {}", e),

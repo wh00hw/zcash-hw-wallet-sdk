@@ -54,6 +54,17 @@ pub enum MsgType {
     TransparentSignReq = 0x0D,
     /// Transparent signature response (v3)
     TransparentSignRsp = 0x0E,
+    /// Request the device's long-term identity pubkey (v4, audit M1).
+    /// No payload.
+    IdentityReq = 0x0F,
+    /// Identity response: 32-byte canonical Pallas pubkey (v4).
+    IdentityRsp = 0x10,
+    /// Attestation request: 32-byte fresh challenge nonce (v4).
+    AttestReq = 0x11,
+    /// Attestation response: sig[64] || rk[32]. With alpha=0 on the device,
+    /// rk equals the device's pubkey, so the companion verifies both
+    /// `rk == pinned_pubkey` and the RedPallas signature (v4).
+    AttestRsp = 0x12,
 }
 
 impl MsgType {
@@ -73,6 +84,10 @@ impl MsgType {
             0x0C => Some(Self::TxTransparentOutput),
             0x0D => Some(Self::TransparentSignReq),
             0x0E => Some(Self::TransparentSignRsp),
+            0x0F => Some(Self::IdentityReq),
+            0x10 => Some(Self::IdentityRsp),
+            0x11 => Some(Self::AttestReq),
+            0x12 => Some(Self::AttestRsp),
             _ => None,
         }
     }
@@ -192,6 +207,154 @@ impl<T: Transport> HwpCodec<T> {
             )));
         }
         self.write_frame(frame.seq, MsgType::Pong, &[])?;
+        Ok(())
+    }
+
+    /// Request the device's long-term identity public key (audit M1).
+    ///
+    /// This is the value the user records (or a separate trusted CLI captures)
+    /// at first pairing, then pins for every subsequent session via
+    /// [`HwpCodec::attest`]. The pubkey is also displayed on the device's
+    /// trusted first-boot console output, which is the authoritative reference
+    /// for the initial pairing.
+    pub fn request_identity(&mut self) -> Result<[u8; 32]> {
+        let seq = self.next_seq();
+        self.write_frame(seq, MsgType::IdentityReq, &[])?;
+
+        let mut keepalive_count = 0usize;
+        loop {
+            let frame = self.read_frame()?;
+            match frame.msg_type {
+                MsgType::Ping => {
+                    keepalive_count += 1;
+                    if keepalive_count > HWP_MAX_KEEPALIVE {
+                        return Err(HwSignerError::MaxKeepaliveExceeded {
+                            max: HWP_MAX_KEEPALIVE,
+                        });
+                    }
+                    self.write_frame(frame.seq, MsgType::Pong, &[])?;
+                    continue;
+                }
+                MsgType::IdentityRsp => {
+                    if frame.payload.len() != 32 {
+                        return Err(HwSignerError::ProtocolError(format!(
+                            "IDENTITY_RSP must be 32 bytes, got {}",
+                            frame.payload.len()
+                        )));
+                    }
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&frame.payload);
+                    return Ok(pk);
+                }
+                MsgType::Error => {
+                    let (code, msg) = parse_error(&frame.payload);
+                    return Err(device_error(code, &msg));
+                }
+                other => {
+                    return Err(HwSignerError::ProtocolError(format!(
+                        "Expected IDENTITY_RSP, got {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Run an attestation round: send a fresh 32-byte challenge to the device
+    /// and verify the returned RedPallas signature against `pinned_pubkey`.
+    ///
+    /// Returns `Ok(())` only if BOTH:
+    ///   1. the device's reply contains an `rk` byte-equal to `pinned_pubkey`
+    ///      (constant-time comparison) — the device-substitution check;
+    ///   2. the RedPallas signature verifies against the challenge digest
+    ///      and `rk` — the replay/forgery check.
+    ///
+    /// The challenge is generated from the OS CSPRNG so a passive observer
+    /// cannot predict the value the device will be asked to sign.
+    ///
+    /// Audit: docs/security-audit/04-host-sdk-rust.md M1.
+    pub fn attest(&mut self, pinned_pubkey: &[u8; 32]) -> Result<()> {
+        use rand_core::{OsRng, RngCore};
+        use subtle::ConstantTimeEq;
+
+        let mut challenge = [0u8; 32];
+        OsRng.fill_bytes(&mut challenge);
+
+        let seq = self.next_seq();
+        self.write_frame(seq, MsgType::AttestReq, &challenge)?;
+
+        let mut keepalive_count = 0usize;
+        let response = loop {
+            let frame = self.read_frame()?;
+            match frame.msg_type {
+                MsgType::Ping => {
+                    keepalive_count += 1;
+                    if keepalive_count > HWP_MAX_KEEPALIVE {
+                        return Err(HwSignerError::MaxKeepaliveExceeded {
+                            max: HWP_MAX_KEEPALIVE,
+                        });
+                    }
+                    self.write_frame(frame.seq, MsgType::Pong, &[])?;
+                    continue;
+                }
+                MsgType::AttestRsp => {
+                    if frame.payload.len() != 96 {
+                        return Err(HwSignerError::ProtocolError(format!(
+                            "ATTEST_RSP must be 96 bytes, got {}",
+                            frame.payload.len()
+                        )));
+                    }
+                    break frame.payload;
+                }
+                MsgType::Error => {
+                    let (code, msg) = parse_error(&frame.payload);
+                    return Err(device_error(code, &msg));
+                }
+                other => {
+                    return Err(HwSignerError::ProtocolError(format!(
+                        "Expected ATTEST_RSP, got {:?}",
+                        other
+                    )));
+                }
+            }
+        };
+
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&response[..64]);
+        let mut rk = [0u8; 32];
+        rk.copy_from_slice(&response[64..96]);
+
+        // (1) Device-substitution check: rk MUST equal the pinned pubkey.
+        if !bool::from(rk.ct_eq(pinned_pubkey)) {
+            return Err(HwSignerError::AttestationFailed {
+                reason: format!(
+                    "device pubkey mismatch: expected {} got {}",
+                    hex::encode(&pinned_pubkey[..8]),
+                    hex::encode(&rk[..8])
+                ),
+            });
+        }
+
+        // (2) Signature check: RedPallas verify(sig, digest, rk),
+        // where digest = BLAKE2b-256(personal=ATTEST_PERSONAL, challenge).
+        let digest = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(b"ZcashHWAttestV1!")
+            .to_state()
+            .update(&challenge)
+            .finalize();
+
+        let sig_obj = reddsa::Signature::<reddsa::orchard::SpendAuth>::from(sig);
+        let vk = reddsa::VerificationKey::<reddsa::orchard::SpendAuth>::try_from(rk)
+            .map_err(|_| HwSignerError::AttestationFailed {
+                reason: "device returned invalid verification key encoding".into(),
+            })?;
+
+        vk.verify(digest.as_bytes(), &sig_obj)
+            .map_err(|e| HwSignerError::AttestationFailed {
+                reason: format!("signature did not verify: {:?}", e),
+            })?;
+
         Ok(())
     }
 

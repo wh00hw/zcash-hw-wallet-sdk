@@ -195,12 +195,14 @@ fn test_parse_error_with_message() {
 
 #[test]
 fn test_msg_type_roundtrip() {
-    for v in 0x01..=0x0Eu8 {
+    /* Range extended to 0x12 to cover the audit-M1 attestation messages
+     * (IdentityReq=0x0F, IdentityRsp=0x10, AttestReq=0x11, AttestRsp=0x12). */
+    for v in 0x01..=0x12u8 {
         let mt = MsgType::from_u8(v).unwrap();
         assert_eq!(mt as u8, v);
     }
     assert!(MsgType::from_u8(0x00).is_none());
-    assert!(MsgType::from_u8(0x0F).is_none());
+    assert!(MsgType::from_u8(0x13).is_none());
 }
 
 #[test]

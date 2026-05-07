@@ -62,10 +62,17 @@ pub mod signer;
 pub mod traits;
 pub mod transport;
 pub mod types;
-#[cfg(feature = "ledger")]
-pub mod ledger_client;
 pub mod verify;
 pub mod workflow;
+
+// `ledger_client` and `protocol::hanh` were exploratory reimplementations of
+// hhanh00's Ledger app protocol. They were never wire-compatible with the
+// upstream Ledger app, the FVK they returned was structurally wrong (the
+// `rivk` slot was filled with `ovk` for "structural compatibility"), and
+// the action-encoding had unresolved endianness questions. Removed in the
+// security-audit follow-up — anyone wanting Ledger support against
+// hhanh00's app should depend on hhanh00's own crate, not on this stub.
+// Audit: docs/security-audit/04-host-sdk-rust.md L1.
 
 // Re-export primary types for ergonomic use
 pub use error::{HwSignerError, Result};

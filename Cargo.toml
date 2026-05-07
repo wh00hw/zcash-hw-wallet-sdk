@@ -33,6 +33,19 @@ zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 blake2b_simd = "1"
 
+# Hash primitives — pulled transitively by orchard but we use them directly
+# in verify.rs::hash160 for transparent pubkey-to-script binding (audit H2).
+# Pinned to a major version that matches what librustzcash uses, to avoid
+# duplicate copies in the build.
+sha2 = "0.10"
+ripemd = "0.1"
+
+# Fresh-nonce generator for attestation challenges (audit M1). OsRng pulls
+# from /dev/urandom on Unix, BCryptGenRandom on Windows — i.e. the platform
+# CSPRNG. Same major version as the rest of the rand_core consumers in the
+# orchard / pczt dependency tree.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
 # Zcash crates — aligned with librustzcash main
 pczt = { version = "0.5", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
 orchard = "0.12"
@@ -59,6 +72,31 @@ ur = { version = "0.4", optional = true }
 tokio = { version = "1", features = ["full"] }
 blake2b_simd = "1"
 
+# ============================================================================
+# [patch.crates-io] — vendored librustzcash submodule
+# ============================================================================
+# The four `path = "librustzcash/..."` entries below redirect crates.io
+# resolution to the in-tree submodule at `librustzcash/`. The submodule is
+# git-pinned via `.gitmodules` to a specific upstream commit; the SHA is
+# recorded in the parent repo's tree and verified at clone time only when
+# someone runs `git submodule update --init`.
+#
+# Pinned commit (audit H4 — keep this in sync with the actual submodule HEAD):
+#   librustzcash @ f646a1119d5e0214d02fb1575e662c6b0ec57c8d
+#
+# To verify the submodule is at the documented commit before a release:
+#   git -C librustzcash rev-parse HEAD
+#   # must match the SHA above
+#
+# When upgrading librustzcash:
+#   1. update the submodule: `cd librustzcash && git fetch && git checkout <new-sha>`
+#   2. update the SHA comment above
+#   3. run `cargo update -p pczt -p zcash_primitives -p zcash_protocol -p zcash_address`
+#   4. re-run the integration tests + the security-audit reports
+#
+# Long-term we want to drop this patch table entirely once `pczt` ships a
+# stable release on crates.io with the hardware-wallet-signer API surface.
+# Audit: docs/security-audit/04-host-sdk-rust.md H4.
 [patch.crates-io]
 pczt = { path = "librustzcash/pczt" }
 orchard = { package = "orchard", git = "https://github.com/zcash/orchard.git", rev = "6b12c77260aa7fac0d804983fc31b71b584d48e0" }

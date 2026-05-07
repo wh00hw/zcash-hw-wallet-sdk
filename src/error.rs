@@ -61,6 +61,11 @@ pub enum HwSignerError {
     #[error("Transparent signature verification failed on input {input_idx}: {reason}")]
     TransparentSignatureVerificationFailed { input_idx: usize, reason: String },
 
+    /// Device attestation failed: the connected device is not the one paired,
+    /// or the response signature is invalid (audit M1).
+    #[error("Device attestation failed: {reason}")]
+    AttestationFailed { reason: String },
+
     // ── Transport errors ────────────────────────────────────────────────
     #[error("Transport error: {0}")]
     TransportError(String),

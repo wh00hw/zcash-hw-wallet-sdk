@@ -127,8 +127,26 @@ static void handle_tx_output(int fd, uint8_t seq, const uint8_t *payload, uint16
         return;
     }
 
-    /* Normal action data (output_index 0..N-1) */
-    serr = orchard_signer_feed_action(&signer_ctx, out.output_data, out.output_data_len);
+    /* Normal action data (output_index 0..N-1).
+     *
+     * The SDK speaks the v4 wire format: HWP_ACTION_DATA_SIZE_V4 = 903
+     * bytes = 820-byte action || 43-byte recipient || 8-byte value
+     * (LE) || 32-byte rseed. The trailing 83 bytes carry note plaintext
+     * for the cmx-recompute defence (audit C-1 protocol).
+     *
+     * The virtual device is a test FIXTURE: integration tests build
+     * synthetic action data where `cmx` is filler bytes, so the
+     * cmx-recompute check would always fail. We extract the 820-byte
+     * action prefix and call the legacy feed_action() path, skipping
+     * the cmx check. Real firmware (e.g. zcash-esp32/main/main.c)
+     * uses orchard_signer_feed_action_with_note() and DOES enforce
+     * the cmx defence end-to-end. */
+    if (out.output_data_len != HWP_ACTION_DATA_SIZE_V4) {
+        send_error(fd, seq, HWP_ERR_BAD_FRAME, "expected v4 action (903 bytes)");
+        orchard_signer_reset(&signer_ctx);
+        return;
+    }
+    serr = orchard_signer_feed_action(&signer_ctx, out.output_data, HWP_ACTION_DATA_SIZE);
     if (serr != SIGNER_OK) {
         const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected action" : "invalid action data";
         HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME;
@@ -136,7 +154,16 @@ static void handle_tx_output(int fd, uint8_t seq, const uint8_t *payload, uint16
         orchard_signer_reset(&signer_ctx);
         return;
     }
-    fprintf(stderr, "[hwp] Action %d/%d hashed\n", out.output_index + 1, out.total_outputs);
+    /* Auto-confirm the just-fed action. The no-blind-signing invariant
+     * (orchard_signer_verify rejects with SIGNER_ERR_ACTION_NOT_CONFIRMED
+     * unless every actions_display[i].confirmed is true) is driven by
+     * per-output user confirmation in real firmware. The virtual device
+     * has no UI; confirming unconditionally is the right behaviour for
+     * a test fixture and matches the no-confirm-needed semantics tests
+     * already assume. */
+    orchard_signer_confirm_action(&signer_ctx, signer_ctx.actions_received - 1);
+    fprintf(stderr, "[hwp] Action %d/%d hashed + auto-confirmed (cmx check skipped — fixture)\n",
+            out.output_index + 1, out.total_outputs);
     send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
 }
 

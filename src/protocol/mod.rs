@@ -11,7 +11,10 @@
 //! Frame format: `[MAGIC:1][VERSION:1][SEQ:1][TYPE:1][LENGTH:2 LE][PAYLOAD:N][CRC16:2 LE]`
 
 pub mod hwp;
-pub mod hanh;
+// `hanh` (legacy hhanh00 Ledger app protocol stub) removed in audit follow-up:
+// the implementation had unresolved endianness issues in the action encoder
+// and was never wire-compatible with the upstream Ledger app. See
+// docs/security-audit/04-host-sdk-rust.md L1.
 
 pub use hwp::{
     ErrorCode, HwpCodec, Frame, MsgType, HWP_HEADER_SIZE, HWP_MAGIC, HWP_MAX_PAYLOAD,

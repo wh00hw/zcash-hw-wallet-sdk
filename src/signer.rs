@@ -76,6 +76,55 @@ impl<T: Transport> DeviceSigner<T> {
     pub fn codec_mut(&mut self) -> &mut HwpCodec<T> {
         &mut self.codec
     }
+
+    /// Construct a DeviceSigner and verify the device's identity against a
+    /// previously-pinned pubkey before returning. Fails with
+    /// [`HwSignerError::AttestationFailed`] if the device responds with an
+    /// `rk` that does not match `pinned_pubkey` or with a signature that
+    /// does not verify against the fresh challenge nonce.
+    ///
+    /// This is the recommended constructor for any application that has
+    /// completed first-pairing — it catches USB-hub MITM substitution,
+    /// localhost TCP impostor, and post-reflash device-key mismatch.
+    /// Audit: docs/security-audit/04-host-sdk-rust.md M1.
+    pub fn new_with_pinned_pubkey(
+        transport: T,
+        coin_type: u32,
+        pinned_pubkey: &[u8; 32],
+    ) -> Result<Self> {
+        let mut signer = Self::new(transport, coin_type)?;
+        signer.codec.attest(pinned_pubkey)?;
+        info!(
+            "Device attestation OK (pinned pubkey: {}...).",
+            hex::encode(&pinned_pubkey[..8])
+        );
+        Ok(signer)
+    }
+
+    /// First-pairing: ask the device for its long-term identity pubkey.
+    /// The caller is expected to STORE this value (in a config file, OS
+    /// keyring, etc.) and pass it to [`Self::new_with_pinned_pubkey`] for
+    /// every subsequent session. The first-pairing flow MUST run on a
+    /// trusted host — typically the same one used to generate the wallet.
+    ///
+    /// The device also displays the same pubkey on its trusted first-boot
+    /// console output; the user should compare the two values to ensure
+    /// the binding is to the expected device, not a pre-flashed hostile
+    /// substitute.
+    pub fn pair(&mut self) -> Result<[u8; 32]> {
+        info!("Pairing: requesting device identity pubkey...");
+        let pk = self.codec.request_identity()?;
+        info!("Device pubkey: {}", hex::encode(&pk));
+        Ok(pk)
+    }
+
+    /// Run an attestation round against an already-known pubkey. Useful for
+    /// re-checking session integrity mid-flight (e.g., before high-value
+    /// signing); typically [`Self::new_with_pinned_pubkey`] is preferred
+    /// for the once-per-session check at construction.
+    pub fn attest(&mut self, pinned_pubkey: &[u8; 32]) -> Result<()> {
+        self.codec.attest(pinned_pubkey)
+    }
 }
 
 impl<T: Transport> HardwareSigner for DeviceSigner<T> {
@@ -262,16 +311,10 @@ pub fn connect_ledger(coin_type: u32) -> Result<DeviceSigner<crate::transport::L
     DeviceSigner::new(transport, coin_type)
 }
 
-/// Connect to a Ledger hardware wallet using the native APDU client (Hahn app).
-///
-/// ```rust,ignore
-/// let client = zcash_hw_wallet_sdk::signer::connect_ledger_apdu()?;
-/// ```
-#[cfg(feature = "ledger")]
-pub fn connect_ledger_apdu() -> Result<crate::ledger_client::LedgerClient> {
-    let transport = crate::transport::LedgerTransport::open()?;
-    Ok(crate::ledger_client::LedgerClient::new(transport))
-}
+// connect_ledger_apdu() was removed alongside the broken hhanh00-protocol
+// reimplementation (see lib.rs L1 note). HWP-speaking devices use
+// connect_ledger() above; Ledger users targeting hhanh00's official app
+// should depend on hhanh00's own crate.
 
 /// Connect to a Ledger app running on Speculos emulator.
 ///
