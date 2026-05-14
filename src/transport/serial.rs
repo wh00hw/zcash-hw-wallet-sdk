@@ -35,6 +35,11 @@ impl SerialTransport {
             .timeout(timeout)
             .open()
             .map_err(|e| HwSignerError::ConnectionFailed(format!("{}: {}", path, e)))?;
+        // Drop any bytes the OS / device buffered from a previous (possibly
+        // crashed or killed) host process — without this, the next handshake
+        // can read a stale frame (e.g. a leftover TxOutputAck) instead of the
+        // device's periodic PING.
+        let _ = port.clear(serialport::ClearBuffer::All);
         info!("Serial: connected to {}", path);
         Ok(Self { port })
     }

@@ -198,10 +198,9 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
         debug!("TxMeta sent ({} bytes), device ACK received", meta_data.len());
 
         // 2. Transparent flow (only if the tx has transparent components).
-        //    The state machine on the device (libzcash-orchard-c, see
-        //    orchard_signer.c::orchard_signer_begin_transparent) accepts the
-        //    transparent stream ONLY from RECEIVING_ACTIONS. Doing this after
-        //    the shielded sighash sentinel would put it in VERIFIED and
+        //    The device's signer state machine (libzcash-orchard-c) accepts
+        //    the transparent stream ONLY from RECEIVING_ACTIONS. Doing this
+        //    after the shielded sighash sentinel would put it in VERIFIED and
         //    `begin_transparent` would return SIGNER_ERR_BAD_STATE; conversely
         //    skipping the flow when transparent_sig_digest is non-empty makes
         //    the shielded `verify()` fail with SIGNER_ERR_TRANSPARENT_NOT_EMPTY.
@@ -231,9 +230,8 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
                 );
             }
             // Transparent sentinel = expected digest at index == total_inputs.
-            // Device recomputes the ZIP-244 transparent digest from the
-            // streamed inputs/outputs, compares it against both the sentinel
-            // and TxMeta.transparent_sig_digest, then flips
+            // Device recomputes the transparent digest, compares it against
+            // both the sentinel and TxMeta.transparent_sig_digest, then flips
             // `transparent_verified = true` and returns to RECEIVING_ACTIONS.
             self.codec.send_transparent_input(
                 num_t_inputs,
@@ -257,11 +255,10 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
             );
         }
 
-        // 4. Shielded sighash sentinel (index == total_actions). The device
-        //    finishes the ZIP-244 shielded-bundle hash, compares against the
-        //    expected value, refuses if any per-action confirmation is
-        //    missing, and finally advances to VERIFIED — only then will
-        //    SIGN_REQ produce a signature.
+        // 4. Shielded sighash sentinel (index == total_actions). Device
+        //    finishes the ZIP-244 shielded-bundle hash, refuses if any
+        //    per-action confirmation is missing, and advances to VERIFIED —
+        //    only then will SIGN_REQ produce a signature.
         self.codec
             .send_tx_output(total_actions, total_actions, sighash)?;
         info!("ZIP-244 shielded sighash verified — device VERIFIED.");

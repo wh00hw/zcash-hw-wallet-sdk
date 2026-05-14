@@ -212,16 +212,27 @@ impl<T: Transport> HwpCodec<T> {
     // ── High-level operations ────────────────────────────────────────
 
     /// Perform the initial handshake: wait for PING, reply with PONG.
+    ///
+    /// The device sends a periodic PING every ~400ms when idle. After a
+    /// previously-crashed or killed host the on-wire stream may still contain
+    /// stale frames (e.g. a TxOutputAck that the device emitted right before
+    /// the host went away). We drain non-PING frames until a fresh PING
+    /// arrives, bounded by `MAX_HANDSHAKE_FRAMES` so a misbehaving peer can't
+    /// keep us looping forever.
     pub fn handshake(&mut self) -> Result<()> {
-        let frame = self.read_frame()?;
-        if frame.msg_type != MsgType::Ping {
-            return Err(HwSignerError::ProtocolError(format!(
-                "Expected PING, got {:?}",
-                frame.msg_type
-            )));
+        const MAX_HANDSHAKE_FRAMES: usize = 8;
+        for _ in 0..MAX_HANDSHAKE_FRAMES {
+            let frame = self.read_frame()?;
+            if frame.msg_type == MsgType::Ping {
+                self.write_frame(frame.seq, MsgType::Pong, &[])?;
+                return Ok(());
+            }
+            // Anything else is a stale frame from a previous session — drop it.
         }
-        self.write_frame(frame.seq, MsgType::Pong, &[])?;
-        Ok(())
+        Err(HwSignerError::ProtocolError(format!(
+            "Handshake: no PING in first {} frames",
+            MAX_HANDSHAKE_FRAMES
+        )))
     }
 
     /// Request the device's long-term identity public key (audit M1).
