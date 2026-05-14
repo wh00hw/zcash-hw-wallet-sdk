@@ -72,23 +72,42 @@ pub trait HardwareSigner {
         Ok(true)
     }
 
-    /// Send transaction metadata and action data to the device for on-device
-    /// ZIP-244 sighash verification (HWP v2).
+    /// Send the entire transaction (metadata + transparent flow + Orchard
+    /// actions + shielded sighash sentinel) to the device for on-device
+    /// ZIP-244 verification (HWP v2/v3/v4).
     ///
-    /// The SDK extracts the transaction header, Orchard bundle metadata, and
-    /// each action's ZIP-244 components from the PCZT. The device uses these
-    /// to independently compute the full ZIP-244 sighash and **refuses to sign**
-    /// if it doesn't match the sighash in the subsequent `SignReq`.
+    /// The order of frames on the wire is fixed by the device's signer state
+    /// machine in `libzcash-orchard-c`:
     ///
-    /// This eliminates the need for the device to blindly trust the companion's sighash.
+    /// ```text
+    /// 1. TX_OUTPUT(idx=0xFFFF)            tx metadata             (IDLE → RECEIVING_ACTIONS)
+    /// 2. TX_TRANSPARENT_INPUT  × n + sentinel                      (begin → RECEIVING_TRANSPARENT)
+    /// 3. TX_TRANSPARENT_OUTPUT × n                                 (still RECEIVING_TRANSPARENT)
+    ///    The transparent sentinel checks the on-device digest and       (→ RECEIVING_ACTIONS)
+    ///    flips `transparent_verified = true`.
+    /// 4. TX_OUTPUT(idx=i)                  Orchard actions × N
+    /// 5. TX_OUTPUT(idx=N)                  shielded sighash sentinel    (→ VERIFIED)
+    /// ```
     ///
-    /// The default implementation is a no-op (v1 behavior: device trusts companion).
-    /// `DeviceSigner` overrides this to send data via the HWP protocol.
-    fn verify_sighash(
+    /// The transparent flow MUST sit between metadata and the action stream;
+    /// once the device transitions to `VERIFIED` it rejects any further
+    /// `begin_transparent` call. Equally, the device's `verify` step refuses
+    /// to advance to `VERIFIED` if `transparent_sig_digest` is non-empty and
+    /// the transparent flow was skipped (`SIGNER_ERR_TRANSPARENT_NOT_EMPTY`).
+    ///
+    /// `transparent_inputs`/`transparent_outputs` should be empty when the
+    /// PCZT has no transparent components; the implementation must skip the
+    /// transparent stream entirely in that case.
+    ///
+    /// The default implementation is a no-op (v1 behavior: device trusts
+    /// companion). `DeviceSigner` overrides this with the HWP-correct order.
+    fn verify_transaction(
         &mut self,
         _meta: &TxMeta,
         _actions: &[ActionData],
         _sighash: &[u8; 32],
+        _transparent_inputs: &[TransparentInputData],
+        _transparent_outputs: &[TransparentOutputData],
     ) -> Result<()> {
         Ok(())
     }
@@ -111,24 +130,5 @@ pub trait HardwareSigner {
         _input_data: &TransparentInputData,
     ) -> Result<TransparentSignResponse> {
         Err(HwSignerError::UnsupportedPool("transparent"))
-    }
-
-    /// Send transparent inputs and outputs to the device for on-device
-    /// transparent digest verification (HWP v3).
-    ///
-    /// The device independently computes the ZIP-244 transparent digest
-    /// from the raw inputs/outputs and compares it with the pre-computed
-    /// `transparent_sig_digest` in TxMeta. This prevents a compromised
-    /// companion from providing a forged transparent digest.
-    ///
-    /// The default implementation is a no-op (v2 behavior: device trusts
-    /// the pre-computed transparent digest from the companion).
-    fn verify_transparent_digest(
-        &mut self,
-        _inputs: &[TransparentInputData],
-        _outputs: &[TransparentOutputData],
-        _expected_digest: &[u8; 32],
-    ) -> Result<()> {
-        Ok(())
     }
 }

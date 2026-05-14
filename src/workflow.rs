@@ -316,8 +316,59 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             actions_to_sign.len()
         );
 
-        // Step 5: Send action data to device for on-device sighash verification (v2)
-        self.signer.verify_sighash(&tx_meta, &all_actions_data, &sighash)?;
+        // Step 5: Collect transparent inputs/outputs up-front so we can hand
+        // the FULL tx (meta + transparent + Orchard + sighash sentinel) to the
+        // device in a single, correctly-ordered verification pass.
+        //
+        // The device's signer state machine refuses to accept the transparent
+        // stream after the shielded sighash sentinel has flipped it to
+        // VERIFIED, and conversely refuses to advance to VERIFIED if
+        // `transparent_sig_digest` is non-empty and the transparent flow was
+        // skipped. So both pieces have to be sent in one ordered batch — see
+        // `HardwareSigner::verify_transaction` for the wire-order contract.
+        let (t_inputs, t_outputs) = {
+            let t_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| {
+                HwSignerError::SignerInitFailed(format!(
+                    "PCZT reparse for transparent: {:?}",
+                    e
+                ))
+            })?;
+            let inputs: Vec<TransparentInputData> = t_pczt
+                .transparent()
+                .inputs()
+                .iter()
+                .map(|inp| TransparentInputData {
+                    prevout_hash: *inp.prevout_txid(),
+                    prevout_index: *inp.prevout_index(),
+                    sequence: inp.sequence().unwrap_or(0xFFFFFFFF),
+                    value: *inp.value(),
+                    script_pubkey: inp.script_pubkey().clone(),
+                })
+                .collect();
+            let outputs: Vec<TransparentOutputData> = t_pczt
+                .transparent()
+                .outputs()
+                .iter()
+                .map(|out| TransparentOutputData {
+                    value: *out.value(),
+                    script_pubkey: out.script_pubkey().clone(),
+                })
+                .collect();
+            (inputs, outputs)
+        };
+        let has_transparent = !t_inputs.is_empty();
+        if has_transparent {
+            info!(
+                "{} transparent input(s), {} output(s) — verification will include transparent digest",
+                t_inputs.len(),
+                t_outputs.len()
+            );
+        }
+
+        // Step 5b: Send the full tx to the device for ZIP-244 verification
+        // (meta → transparent flow if any → Orchard actions → sighash sentinel).
+        self.signer
+            .verify_transaction(&tx_meta, &all_actions_data, &sighash, &t_inputs, &t_outputs)?;
 
         // Step 6: Request user confirmation on device (if details provided)
         if let Some(ref details) = details {
@@ -365,101 +416,85 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             actions_signed += 1;
         }
 
-        // Step 8: Transparent signing (if transparent inputs present)
+        // Step 8: Transparent signing — the device already verified the
+        // transparent digest as part of step 5b's `verify_transaction` call,
+        // so it is in VERIFIED state with `transparent_verified = true`. We
+        // only have to drive the per-input ECDSA signing requests now.
         let mut transparent_inputs_signed = 0usize;
-        {
-            let t_pczt = pczt::Pczt::parse(&pczt_bytes)
-                .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse for transparent: {:?}", e)))?;
-            let t_inputs = t_pczt.transparent().inputs();
-            let t_outputs = t_pczt.transparent().outputs();
+        if has_transparent {
+            let t_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| {
+                HwSignerError::SignerInitFailed(format!(
+                    "PCZT reparse for transparent: {:?}",
+                    e
+                ))
+            })?;
+            let pczt_t_inputs = t_pczt.transparent().inputs();
 
-            if !t_inputs.is_empty() {
-                info!("{} transparent input(s), {} output(s) — starting transparent flow",
-                      t_inputs.len(), t_outputs.len());
+            for (i, t_input_data) in t_inputs.iter().enumerate() {
+                // Per-input sighash comes from the pczt signer (ZIP-244 S.2)
+                let t_sighash = signer_role.transparent_sighash(i).map_err(|e| {
+                    HwSignerError::SignerInitFailed(format!(
+                        "transparent_sighash({}) failed: {:?}",
+                        i, e
+                    ))
+                })?;
 
-                // 8a. Extract transparent input/output data for on-device digest verification
-                let input_data: Vec<TransparentInputData> = t_inputs.iter().map(|inp| {
-                    TransparentInputData {
-                        prevout_hash: *inp.prevout_txid(),
-                        prevout_index: *inp.prevout_index(),
-                        sequence: inp.sequence().unwrap_or(0xFFFFFFFF),
-                        value: *inp.value(),
-                        script_pubkey: inp.script_pubkey().clone(),
-                    }
-                }).collect();
+                let request = TransparentSignRequest {
+                    sighash: t_sighash,
+                    input_index: i,
+                    total_inputs: pczt_t_inputs.len(),
+                    value: *pczt_t_inputs[i].value(),
+                    script_pubkey: pczt_t_inputs[i].script_pubkey().clone(),
+                };
 
-                let output_data: Vec<TransparentOutputData> = t_outputs.iter().map(|out| {
-                    TransparentOutputData {
-                        value: *out.value(),
-                        script_pubkey: out.script_pubkey().clone(),
-                    }
-                }).collect();
+                let response = self.signer.sign_transparent_input(&request, t_input_data)?;
 
-                // 8b. Send to device for on-device transparent digest verification (v3)
-                self.signer.verify_transparent_digest(
-                    &input_data,
-                    &output_data,
-                    &tx_meta.transparent_sig_digest,
+                // The DER signature carries a trailing sighash_type byte
+                // (Bitcoin convention); strip it before parsing the
+                // ECDSA structure for both verification and PCZT injection.
+                let der_sig_bytes =
+                    &response.signature[..response.signature.len().saturating_sub(1)];
+
+                // Defence-in-depth host re-verification of the ECDSA
+                // signature against the host-computed sighash and the
+                // device-returned pubkey, plus a HASH160 cross-check tying
+                // that pubkey to the input's P2PKH script_pubkey. Mirrors
+                // the Orchard verify pattern; closes the gap where a buggy
+                // or hostile device could return a valid-DER but
+                // cryptographically wrong signature, or sign with the wrong
+                // key. Audit: docs/security-audit/04-host-sdk-rust.md H2.
+                crate::verify::verify_transparent_signature(
+                    &t_sighash,
+                    der_sig_bytes,
+                    &response.pubkey,
+                    &request.script_pubkey,
+                    i,
                 )?;
 
-                // 8c. Sign each transparent input that needs a hardware signature
-                for i in 0..t_inputs.len() {
-                    // Get the per-input sighash from the pczt signer
-                    let t_sighash = signer_role.transparent_sighash(i)
-                        .map_err(|e| HwSignerError::SignerInitFailed(format!(
-                            "transparent_sighash({}) failed: {:?}", i, e
-                        )))?;
+                let ecdsa_sig = secp256k1::ecdsa::Signature::from_der(der_sig_bytes).map_err(
+                    |e| HwSignerError::TransparentSignatureVerificationFailed {
+                        input_idx: i,
+                        reason: format!("Invalid DER signature: {}", e),
+                    },
+                )?;
 
-                    let request = TransparentSignRequest {
-                        sighash: t_sighash,
-                        input_index: i,
-                        total_inputs: t_inputs.len(),
-                        value: *t_inputs[i].value(),
-                        script_pubkey: t_inputs[i].script_pubkey().clone(),
-                    };
+                signer_role
+                    .append_transparent_signature(i, ecdsa_sig)
+                    .map_err(|e| {
+                        HwSignerError::SignerInitFailed(format!(
+                            "Failed to apply transparent signature for input {}: {:?}",
+                            i, e
+                        ))
+                    })?;
 
-                    let response = self.signer.sign_transparent_input(&request, &input_data[i])?;
-
-                    // The DER signature carries a trailing sighash_type byte
-                    // (Bitcoin convention); strip it before parsing the
-                    // ECDSA structure for both verification and PCZT injection.
-                    let der_sig_bytes = &response.signature[..response.signature.len().saturating_sub(1)];
-
-                    // Defence-in-depth host re-verification of the ECDSA
-                    // signature against the host-computed sighash and the
-                    // device-returned pubkey, plus a HASH160 cross-check
-                    // tying that pubkey to the input's P2PKH script_pubkey.
-                    // Mirrors the Orchard verify pattern; closes the gap
-                    // where a buggy or hostile device could return a
-                    // valid-DER but cryptographically wrong signature, or
-                    // sign with the wrong key.
-                    // Audit: docs/security-audit/04-host-sdk-rust.md H2.
-                    crate::verify::verify_transparent_signature(
-                        &t_sighash,
-                        der_sig_bytes,
-                        &response.pubkey,
-                        &request.script_pubkey,
-                        i,
-                    )?;
-
-                    let ecdsa_sig = secp256k1::ecdsa::Signature::from_der(der_sig_bytes)
-                        .map_err(|e| HwSignerError::TransparentSignatureVerificationFailed {
-                            input_idx: i,
-                            reason: format!("Invalid DER signature: {}", e),
-                        })?;
-
-                    signer_role
-                        .append_transparent_signature(i, ecdsa_sig)
-                        .map_err(|e| HwSignerError::SignerInitFailed(format!(
-                            "Failed to apply transparent signature for input {}: {:?}", i, e
-                        )))?;
-
-                    debug!("transparent input[{}]: signed and applied OK", i);
-                    transparent_inputs_signed += 1;
-                }
-
-                info!("{} transparent input(s) signed by hardware", transparent_inputs_signed);
+                debug!("transparent input[{}]: signed and applied OK", i);
+                transparent_inputs_signed += 1;
             }
+
+            info!(
+                "{} transparent input(s) signed by hardware",
+                transparent_inputs_signed
+            );
         }
 
         // Step 9: Finalize and return signed PCZT

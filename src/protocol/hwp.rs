@@ -113,6 +113,17 @@ pub enum ErrorCode {
     InvalidState = 0x0A,
     /// Device-computed transparent digest does not match companion's (v3)
     TransparentDigestMismatch = 0x0B,
+    /// `sapling_digest` in TxMeta is not the empty-bundle constant — the
+    /// device is Orchard-only and refuses any tx that carries Sapling
+    /// components (v4).
+    SaplingNotEmpty = 0x0C,
+    /// Device-recomputed `cmx` (from claimed recipient/value/rseed) does not
+    /// match the action's `cmx` field — recipient-substitution attempt (v4).
+    NoteCommitmentMismatch = 0x0D,
+    /// `SIGN_REQ.recipient` decodes to an Orchard receiver that does not
+    /// match any of the per-output recipients the user just confirmed —
+    /// hostile companion lying about the destination (v4).
+    RecipientMismatch = 0x0E,
 }
 
 impl ErrorCode {
@@ -129,6 +140,9 @@ impl ErrorCode {
             0x09 => Self::SighashMismatch,
             0x0A => Self::InvalidState,
             0x0B => Self::TransparentDigestMismatch,
+            0x0C => Self::SaplingNotEmpty,
+            0x0D => Self::NoteCommitmentMismatch,
+            0x0E => Self::RecipientMismatch,
             _ => Self::Unknown,
         }
     }
@@ -885,6 +899,29 @@ fn device_error(code: ErrorCode, msg: &str) -> HwSignerError {
             reason: "Device-computed sighash does not match companion sighash".into(),
         },
         ErrorCode::TransparentDigestMismatch => HwSignerError::TransparentSighashMismatch,
+        // v4 device-side invariants — surface them as typed errors so
+        // callers can recognise them without parsing the message string.
+        ErrorCode::SaplingNotEmpty => HwSignerError::SaplingNotSupported {
+            // The wire frame doesn't carry the count breakdown, but the
+            // device only triggers this when sapling_digest is non-empty,
+            // which means at least one Sapling component was present.
+            spends: 0,
+            outputs: 0,
+        },
+        ErrorCode::NoteCommitmentMismatch => HwSignerError::NoteCommitmentMismatch {
+            reason: if msg.is_empty() {
+                "Device-recomputed cmx does not match action's cmx".into()
+            } else {
+                msg.to_string()
+            },
+        },
+        ErrorCode::RecipientMismatch => HwSignerError::RecipientMismatch {
+            reason: if msg.is_empty() {
+                "SIGN_REQ recipient does not match any confirmed action".into()
+            } else {
+                msg.to_string()
+            },
+        },
         _ => HwSignerError::DeviceError(format!("{:?}: {}", code, msg)),
     }
 }

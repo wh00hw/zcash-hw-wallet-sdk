@@ -172,44 +172,99 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
         Ok(true)
     }
 
-    fn verify_sighash(
+    fn verify_transaction(
         &mut self,
         meta: &TxMeta,
         actions: &[ActionData],
         sighash: &[u8; 32],
+        transparent_inputs: &[TransparentInputData],
+        transparent_outputs: &[TransparentOutputData],
     ) -> Result<()> {
-        let total = actions.len() as u16;
+        let total_actions = actions.len() as u16;
+        let num_t_inputs = transparent_inputs.len() as u16;
+        let num_t_outputs = transparent_outputs.len() as u16;
+        let has_transparent = num_t_inputs > 0 || num_t_outputs > 0;
+
         info!(
-            "Sending tx metadata + {} action(s) to device for ZIP-244 sighash verification (v2)...",
-            total
+            "Verifying tx on device: {} action(s), {} transparent input(s), {} transparent output(s)",
+            total_actions, num_t_inputs, num_t_outputs
         );
 
-        // 1. Send transaction metadata (index = 0xFFFF sentinel)
+        // 1. Send transaction metadata (index = 0xFFFF sentinel).
+        //    Advances device state IDLE → RECEIVING_ACTIONS.
         let meta_data = meta.serialize();
-
         self.codec
-            .send_tx_output(0xFFFF, total, &meta_data)?;
-        info!("TxMeta sent ({} bytes), device ACK received", meta_data.len());
+            .send_tx_output(0xFFFF, total_actions, &meta_data)?;
+        debug!("TxMeta sent ({} bytes), device ACK received", meta_data.len());
 
-        // 2. Send each action's ZIP-244 data
+        // 2. Transparent flow (only if the tx has transparent components).
+        //    The state machine on the device (libzcash-orchard-c, see
+        //    orchard_signer.c::orchard_signer_begin_transparent) accepts the
+        //    transparent stream ONLY from RECEIVING_ACTIONS. Doing this after
+        //    the shielded sighash sentinel would put it in VERIFIED and
+        //    `begin_transparent` would return SIGNER_ERR_BAD_STATE; conversely
+        //    skipping the flow when transparent_sig_digest is non-empty makes
+        //    the shielded `verify()` fail with SIGNER_ERR_TRANSPARENT_NOT_EMPTY.
+        //    So the transparent flow MUST sit between meta and the action
+        //    stream — that is the contract this method enforces.
+        if has_transparent {
+            for (i, input) in transparent_inputs.iter().enumerate() {
+                let data = input.serialize();
+                self.codec
+                    .send_transparent_input(i as u16, num_t_inputs, &data)?;
+                debug!(
+                    "TxTransparentInput {}/{} sent ({} bytes)",
+                    i + 1,
+                    num_t_inputs,
+                    data.len()
+                );
+            }
+            for (i, output) in transparent_outputs.iter().enumerate() {
+                let data = output.serialize();
+                self.codec
+                    .send_transparent_output(i as u16, num_t_outputs, &data)?;
+                debug!(
+                    "TxTransparentOutput {}/{} sent ({} bytes)",
+                    i + 1,
+                    num_t_outputs,
+                    data.len()
+                );
+            }
+            // Transparent sentinel = expected digest at index == total_inputs.
+            // Device recomputes the ZIP-244 transparent digest from the
+            // streamed inputs/outputs, compares it against both the sentinel
+            // and TxMeta.transparent_sig_digest, then flips
+            // `transparent_verified = true` and returns to RECEIVING_ACTIONS.
+            self.codec.send_transparent_input(
+                num_t_inputs,
+                num_t_inputs,
+                &meta.transparent_sig_digest,
+            )?;
+            info!("Transparent digest verified — device confirmed match.");
+        }
+
+        // 3. Send each Orchard action's ZIP-244 data (v4 = 903 bytes incl.
+        //    note plaintext for on-device cmx recomputation).
         for (i, action) in actions.iter().enumerate() {
             let output_data = action.serialize();
             self.codec
-                .send_tx_output(i as u16, total, &output_data)?;
-            info!(
+                .send_tx_output(i as u16, total_actions, &output_data)?;
+            debug!(
                 "TxOutput {}/{} sent ({} bytes), device ACK received",
                 i + 1,
-                total,
+                total_actions,
                 output_data.len()
             );
         }
 
-        // 3. Send expected sighash as sentinel (index = total)
-        // The device has now computed its own ZIP-244 sighash from the metadata +
-        // action data. It compares with this value and returns SighashMismatch on error.
+        // 4. Shielded sighash sentinel (index == total_actions). The device
+        //    finishes the ZIP-244 shielded-bundle hash, compares against the
+        //    expected value, refuses if any per-action confirmation is
+        //    missing, and finally advances to VERIFIED — only then will
+        //    SIGN_REQ produce a signature.
         self.codec
-            .send_tx_output(total, total, sighash)?;
-        info!("ZIP-244 sighash verified — device confirmed match.");
+            .send_tx_output(total_actions, total_actions, sighash)?;
+        info!("ZIP-244 shielded sighash verified — device VERIFIED.");
 
         Ok(())
     }
@@ -232,54 +287,6 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
         )?;
         info!("Transparent signature received from device.");
         Ok(response)
-    }
-
-    fn verify_transparent_digest(
-        &mut self,
-        inputs: &[TransparentInputData],
-        outputs: &[TransparentOutputData],
-        expected_digest: &[u8; 32],
-    ) -> Result<()> {
-        let num_inputs = inputs.len() as u16;
-        let num_outputs = outputs.len() as u16;
-        info!(
-            "Sending {} transparent input(s) + {} output(s) to device for digest verification (v3)...",
-            num_inputs, num_outputs
-        );
-
-        // 1. Send each transparent input
-        for (i, input) in inputs.iter().enumerate() {
-            let data = input.serialize();
-            self.codec
-                .send_transparent_input(i as u16, num_inputs, &data)?;
-            debug!(
-                "TxTransparentInput {}/{} sent ({} bytes)",
-                i + 1,
-                num_inputs,
-                data.len()
-            );
-        }
-
-        // 2. Send each transparent output
-        for (i, output) in outputs.iter().enumerate() {
-            let data = output.serialize();
-            self.codec
-                .send_transparent_output(i as u16, num_outputs, &data)?;
-            debug!(
-                "TxTransparentOutput {}/{} sent ({} bytes)",
-                i + 1,
-                num_outputs,
-                data.len()
-            );
-        }
-
-        // 3. Send expected digest as sentinel (index == total_inputs)
-        // Device compares its computed transparent digest with this value.
-        self.codec
-            .send_transparent_input(num_inputs, num_inputs, expected_digest)?;
-        info!("Transparent digest verified — device confirmed match.");
-
-        Ok(())
     }
 }
 

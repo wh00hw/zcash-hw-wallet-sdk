@@ -596,7 +596,7 @@ The SDK is **hardware-agnostic** -- implement the `HardwareSigner` trait or spea
 
 ### Device-side: libzcash-orchard-c
 
-The companion library [**libzcash-orchard-c**](https://github.com/wh00hw/libzcash-orchard-c) provides a pure C11 implementation of the Zcash Orchard primitives and the HWP v2 protocol, designed specifically for embedded hardware wallets where Rust is not available.
+The companion library [**libzcash-orchard-c**](https://github.com/wh00hw/libzcash-orchard-c) provides a pure C11 implementation of the Zcash Orchard primitives and the HWP protocol, designed specifically for embedded hardware wallets where Rust is not available.
 
 It includes:
 
@@ -606,12 +606,14 @@ It includes:
 - **Pallas / RedPallas** curve arithmetic and spend authorization signing (Orchard)
 - **secp256k1 / ECDSA** — curve arithmetic (constant-time Montgomery ladder), ECDSA signing with RFC 6979, DER encoding (Transparent)
 - **Orchard Unified Address** generation with F4Jumble (ZIP-316) and Bech32m
-- **HWP v2/v3 protocol** implementation (matching this SDK's host-side protocol)
-- **Crypto primitives**: BLAKE2b, SHA-256/512, HMAC, PBKDF2, AES-256 (FF1)
+- **Base58Check + transparent address rendering** — `script_to_taddr()` decodes P2PKH/P2SH `script_pubkey` to the Zcash t-address string (mainnet `t1`/`t3`, testnet `tm`/`t2`), so the device shows the actual destination of transparent outputs (shielded → t-addr sweep) instead of only the change Orchard receivers
+- **HWP v2/v3/v4 protocol** implementation matching this SDK's host-side protocol
+- **Target-agnostic protocol dispatcher** (`hwp_dispatcher.h`) — the full device-side state machine (drain → parse → switch → reply, PING/PONG keepalive, IDLE detection, multi-frame drain handling, per-output review, recipient binding) lives in the library and is exposed through a callback-based API. A new device target wires up ~6 I/O + UI callbacks and gets the protocol implementation for free. The Rust SDK ↔ libzcash protocol contract is therefore mirrored on both sides by one canonical implementation each, not re-derived per device target.
+- **Crypto primitives**: BLAKE2b, SHA-256/512, HMAC, PBKDF2 (with optional progress callback for PIN unlock UI), AES-256 (FF1)
 - **BIP39** mnemonic generation
 - **Zero external dependencies** — portable to any platform with a C11 compiler
 
-Together, the two projects form a complete stack: `libzcash-orchard-c` runs on the device (firmware), while `zcash-hw-wallet-sdk` runs on the host (wallet application), communicating over the shared HWP v2 protocol.
+Together, the two projects form a complete plug-and-play stack: `libzcash-orchard-c` runs on the device (firmware) and owns everything below the wire, `zcash-hw-wallet-sdk` runs on the host (wallet application) and owns everything above the wire, and the HWP protocol between them is the frozen contract that lets the two halves evolve independently. A new device firmware reduces to platform-specific I/O + UI glue; a new wallet application reduces to building PCZTs and calling `PcztHardwareSigning::sign_with_details()`.
 
 ## librustzcash Compatibility
 

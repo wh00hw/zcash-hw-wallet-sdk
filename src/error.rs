@@ -58,6 +58,19 @@ pub enum HwSignerError {
     )]
     SaplingNotSupported { spends: usize, outputs: usize },
 
+    /// Device rejected the action because the on-device cmx recomputation
+    /// from the claimed `(recipient, value, rseed)` did not match the cmx
+    /// field of the action — recipient-substitution attempt (HWP 0x0D).
+    #[error("Note commitment mismatch on device: {reason}")]
+    NoteCommitmentMismatch { reason: String },
+
+    /// Device rejected the SIGN_REQ because the recipient UA does not
+    /// decode to any of the Orchard receivers the user just confirmed via
+    /// per-output review — hostile companion lying about the destination
+    /// (HWP 0x0E).
+    #[error("Recipient mismatch on device: {reason}")]
+    RecipientMismatch { reason: String },
+
     #[error("Transparent signature verification failed on input {input_idx}: {reason}")]
     TransparentSignatureVerificationFailed { input_idx: usize, reason: String },
 
