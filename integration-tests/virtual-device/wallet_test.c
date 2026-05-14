@@ -4,26 +4,30 @@
 #include "redpallas.h"
 #include "memzero.h"
 #include "test_vectors.h"
-#include "sinsemilla_s.h"
 #include <string.h>
 #include <stdio.h>
-
-/* Sinsemilla S-table lookup (from embedded header) */
-static bool sinsemilla_lookup(uint32_t index, uint8_t buf_out[64], void *ctx)
-{
-    (void)ctx;
-    if (index >= 1024) return false;
-    /* Decompress: SINSEMILLA_S_COMPRESSED is 32 bytes per point.
-     * Copy compressed x-coordinate, pallas_point_decompress handles the rest. */
-    memcpy(buf_out, SINSEMILLA_S_COMPRESSED[index], 32);
-    memset(buf_out + 32, 0, 32);
-    return true;
-}
 
 void wallet_test_init(void)
 {
     pallas_init();
-    pallas_set_sinsemilla_lookup(sinsemilla_lookup, NULL);
+    /* Intentionally do NOT register a sinsemilla_set_lookup callback.
+     *
+     * The previous code wired up an in-RAM table from the compressed
+     * sinsemilla_s.h header but returned only the 32-byte x-coordinate
+     * with a zeroed y — without the sqrt(x³+5) decompression step the
+     * header expects. The garbage points silently corrupted on-device
+     * cmx recomputation: the OLD virtual-device hid the problem by
+     * routing TX_OUTPUT actions through orchard_signer_feed_action()
+     * (v3 path, no cmx check); the new hwp_dispatcher uses
+     * orchard_signer_feed_action_with_note() (v4, mandatory cmx
+     * verification) which immediately surfaced the broken lookup as
+     * NOTE_COMMITMENT_MISMATCH.
+     *
+     * Fall back to pallas's reference compute-on-the-fly: ~order of
+     * magnitude slower than a properly decompressed table but agrees
+     * bit-for-bit with the libzcash unit test suite (which deliberately
+     * runs the same fallback path) and the FlipZcash firmware's
+     * SD-card decompressed-table path. */
     fprintf(stderr, "[wallet] Initialized with hardcoded test seed\n");
 }
 

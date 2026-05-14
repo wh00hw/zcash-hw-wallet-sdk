@@ -1,464 +1,243 @@
-/**
+/*
  * Virtual HWP Device — TCP server for integration testing.
  *
- * Implements the full HWP v2 protocol over TCP, using libzcash-orchard-c
- * for crypto operations. Adapted from zcash-esp32/main/main.c.
+ * Speaks the HWP protocol over TCP using the **same** hwp_dispatcher
+ * the FlipZcash firmware uses on USB CDC. The application layer here
+ * is a single main() that:
+ *   1. Derives a deterministic key set from the hardcoded test seed.
+ *   2. Listens on TCP, accepts one client at a time.
+ *   3. Wires the client socket into hwp_dispatcher_run() via four
+ *      I/O callbacks (drain / send / tick / sleep + should_exit) and
+ *      headless auto-confirming UI callbacks.
+ *
+ * No protocol logic lives here — that's intentional. Any protocol
+ * change made in libzcash-orchard-c's dispatcher is automatically
+ * reflected in this fixture, keeping the SDK's integration tests
+ * pinned to the canonical device-side implementation rather than a
+ * drifting re-implementation.
  *
  * Usage: ./virtual-device [--port PORT]
  */
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include "hwp.h"
-#include "orchard_signer.h"
-#include "secp256k1.h"
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+
 #include "bip32.h"
+#include "hwp_dispatcher.h"
 #include "memzero.h"
+#include "orchard.h"
+#include "orchard_signer.h"
+#include "redpallas.h"
 #include "tcp_transport.h"
 #include "wallet_test.h"
 
 #define DEFAULT_PORT 9999
 
-static uint8_t tx_buf[HWP_MAX_FRAME];
-static HwpParser rx_parser;
-static OrchardSignerCtx signer_ctx;
+/* ── Session state passed as user_ctx to every dispatcher callback ── */
 
-/* ── Helpers ──────────────────────────────────────────────────────── */
+typedef struct {
+    int client_fd;
+    bool client_disconnected;   /* set on EOF from recv() */
+    OrchardSignerCtx signer;
 
-static void send_frame(int fd, uint8_t seq, uint8_t msg_type,
-                       const uint8_t *payload, uint16_t payload_len)
-{
-    size_t len = hwp_encode(tx_buf, seq, msg_type, payload, payload_len);
-    tcp_send(fd, tx_buf, len);
+    /* Pre-derived key material; lifetime spans the dispatcher loop. */
+    uint8_t ak[32], nk[32], rivk[32], ask[32];
+    uint8_t t_sk[32], t_pubkey[33];
+
+    uint32_t coin_type;
+    bool testnet;
+} Session;
+
+/* ── I/O callbacks ────────────────────────────────────────────────── */
+
+static size_t cb_serial_drain(uint8_t* out, size_t out_cap, void* ctx) {
+    Session* s = (Session*)ctx;
+    if(s->client_disconnected) return 0;
+    /* Non-blocking; loop iteration handles the polling cadence. */
+    ssize_t n = recv(s->client_fd, out, out_cap, MSG_DONTWAIT);
+    if(n > 0) return (size_t)n;
+    if(n == 0) {
+        s->client_disconnected = true;
+        return 0;
+    }
+    /* EAGAIN / EWOULDBLOCK is the steady state; anything else is a
+     * real error and we treat it the same as disconnect so the loop
+     * exits cleanly. */
+    return 0;
 }
 
-static void send_error(int fd, uint8_t seq, HwpErrorCode code, const char *msg)
-{
-    fprintf(stderr, "[hwp] ERR 0x%02x: %s\n", code, msg ? msg : "");
-    size_t len = hwp_encode_error(tx_buf, seq, code, msg);
-    tcp_send(fd, tx_buf, len);
+static void cb_serial_send(const uint8_t* data, size_t len, void* ctx) {
+    Session* s = (Session*)ctx;
+    if(s->client_disconnected) return;
+    if(tcp_send(s->client_fd, data, len) != 0) {
+        s->client_disconnected = true;
+    }
 }
 
-static void send_ping(int fd)
-{
-    send_frame(fd, 0x01, HWP_MSG_PING, NULL, 0);
-    fprintf(stderr, "[hwp] PING sent\n");
+static uint32_t cb_tick_ms(void* ctx) {
+    (void)ctx;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
 }
 
-/* ── Handlers (adapted from zcash-esp32/main/main.c) ─────────────── */
-
-static void handle_fvk_req(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
-{
-    /* Parse coin_type from payload (4 bytes LE), or default */
-    uint32_t coin_type = 1; /* default: testnet */
-    if (payload_len >= 4) {
-        coin_type = (uint32_t)payload[0]
-                  | ((uint32_t)payload[1] << 8)
-                  | ((uint32_t)payload[2] << 16)
-                  | ((uint32_t)payload[3] << 24);
-    }
-
-    fprintf(stderr, "[hwp] FVK_REQ (seq=%d, coin_type=%u)\n", seq, (unsigned)coin_type);
-    signer_ctx.coin_type = coin_type;
-
-    uint8_t fvk[96];
-    if (wallet_test_get_fvk(fvk, coin_type) != 0) {
-        send_error(fd, seq, HWP_ERR_SIGN_FAILED, "key derivation failed");
-        return;
-    }
-    send_frame(fd, seq, HWP_MSG_FVK_RSP, fvk, 96);
-    fprintf(stderr, "[hwp] FVK_RSP sent (coin_type=%u)\n", (unsigned)coin_type);
+static void cb_sleep_ms(uint32_t ms, void* ctx) {
+    (void)ctx;
+    struct timespec ts = {.tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
 }
 
-static void handle_tx_output(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
-{
-    HwpTxOutput out;
-    if (!hwp_parse_tx_output(payload, payload_len, &out)) {
-        send_error(fd, seq, HWP_ERR_BAD_FRAME, "invalid tx_output payload");
-        return;
-    }
-
-    OrchardSignerError serr;
-
-    /* Metadata message (output_index == 0xFFFF) */
-    if (out.output_index == HWP_TX_META_INDEX) {
-        serr = orchard_signer_feed_meta(&signer_ctx, out.output_data,
-                                         out.output_data_len, out.total_outputs);
-        if (serr == SIGNER_ERR_NETWORK_MISMATCH) {
-            fprintf(stderr, "[hwp] Network mismatch: session=%u vs meta=%u\n",
-                    (unsigned)signer_ctx.coin_type, (unsigned)signer_ctx.tx_meta.coin_type);
-            send_error(fd, seq, HWP_ERR_NETWORK_MISMATCH, "coin_type mismatch");
-            orchard_signer_reset(&signer_ctx);
-            return;
-        }
-        if (serr != SIGNER_OK) {
-            send_error(fd, seq, HWP_ERR_BAD_FRAME, "invalid tx metadata");
-            orchard_signer_reset(&signer_ctx);
-            return;
-        }
-        fprintf(stderr, "[hwp] TX metadata received, expecting %d actions\n", out.total_outputs);
-        send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
-        return;
-    }
-
-    /* Sentinel (output_index == total_outputs): expected sighash */
-    if (out.output_index == out.total_outputs) {
-        if (out.output_data_len != 32) {
-            send_error(fd, seq, HWP_ERR_BAD_FRAME, "sentinel must be 32 bytes");
-            orchard_signer_reset(&signer_ctx);
-            return;
-        }
-
-        serr = orchard_signer_verify(&signer_ctx, out.output_data);
-        if (serr == SIGNER_ERR_SIGHASH_MISMATCH) {
-            fprintf(stderr, "[hwp] ZIP-244 sighash MISMATCH\n");
-            send_error(fd, seq, HWP_ERR_SIGHASH_MISMATCH, "ZIP-244 sighash mismatch");
-            return;
-        }
-        if (serr != SIGNER_OK) {
-            fprintf(stderr, "[hwp] Sighash verify failed (err=%d)\n", serr);
-            send_error(fd, seq, HWP_ERR_INVALID_STATE, "sighash verify failed");
-            orchard_signer_reset(&signer_ctx);
-            return;
-        }
-        fprintf(stderr, "[hwp] ZIP-244 sighash verified — signing authorized\n");
-        send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
-        return;
-    }
-
-    /* Normal action data (output_index 0..N-1).
-     *
-     * The SDK speaks the v4 wire format: HWP_ACTION_DATA_SIZE_V4 = 903
-     * bytes = 820-byte action || 43-byte recipient || 8-byte value
-     * (LE) || 32-byte rseed. The trailing 83 bytes carry note plaintext
-     * for the cmx-recompute defence (audit C-1 protocol).
-     *
-     * The virtual device is a test FIXTURE: integration tests build
-     * synthetic action data where `cmx` is filler bytes, so the
-     * cmx-recompute check would always fail. We extract the 820-byte
-     * action prefix and call the legacy feed_action() path, skipping
-     * the cmx check. Real firmware (e.g. zcash-esp32/main/main.c)
-     * uses orchard_signer_feed_action_with_note() and DOES enforce
-     * the cmx defence end-to-end. */
-    if (out.output_data_len != HWP_ACTION_DATA_SIZE_V4) {
-        send_error(fd, seq, HWP_ERR_BAD_FRAME, "expected v4 action (903 bytes)");
-        orchard_signer_reset(&signer_ctx);
-        return;
-    }
-    serr = orchard_signer_feed_action(&signer_ctx, out.output_data, HWP_ACTION_DATA_SIZE);
-    if (serr != SIGNER_OK) {
-        const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected action" : "invalid action data";
-        HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME;
-        send_error(fd, seq, code, msg);
-        orchard_signer_reset(&signer_ctx);
-        return;
-    }
-    /* Auto-confirm the just-fed action. The no-blind-signing invariant
-     * (orchard_signer_verify rejects with SIGNER_ERR_ACTION_NOT_CONFIRMED
-     * unless every actions_display[i].confirmed is true) is driven by
-     * per-output user confirmation in real firmware. The virtual device
-     * has no UI; confirming unconditionally is the right behaviour for
-     * a test fixture and matches the no-confirm-needed semantics tests
-     * already assume. */
-    orchard_signer_confirm_action(&signer_ctx, signer_ctx.actions_received - 1);
-    fprintf(stderr, "[hwp] Action %d/%d hashed + auto-confirmed (cmx check skipped — fixture)\n",
-            out.output_index + 1, out.total_outputs);
-    send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+static bool cb_should_exit(void* ctx) {
+    Session* s = (Session*)ctx;
+    return s->client_disconnected;
 }
 
-static void handle_sign_req(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
-{
-    HwpSignReq req;
-    if (!hwp_parse_sign_req(payload, payload_len, &req)) {
-        send_error(fd, seq, HWP_ERR_BAD_FRAME, "invalid sign_req payload");
-        return;
-    }
+/* ── UI callbacks (headless: auto-confirm + log) ──────────────────── */
 
-    fprintf(stderr, "[hwp] SIGN_REQ (amount=%llu, fee=%llu)\n",
-            (unsigned long long)req.amount, (unsigned long long)req.fee);
-
-    /* Check ZIP-244 verification */
-    OrchardSignerError chk = orchard_signer_check(&signer_ctx, req.sighash);
-    if (chk == SIGNER_ERR_NOT_VERIFIED) {
-        send_error(fd, seq, HWP_ERR_INVALID_STATE, "sighash not verified");
-        return;
-    }
-    if (chk == SIGNER_ERR_WRONG_SIGHASH) {
-        send_error(fd, seq, HWP_ERR_SIGHASH_MISMATCH, "SignReq sighash mismatch");
-        orchard_signer_reset(&signer_ctx);
-        return;
-    }
-
-    uint32_t coin_type = signer_ctx.coin_type ? signer_ctx.coin_type : 1;
-    uint8_t sig[64], rk[32];
-    if (wallet_test_sign(&signer_ctx, req.sighash, req.alpha, sig, rk, coin_type) != 0) {
-        send_error(fd, seq, HWP_ERR_SIGN_FAILED, "signing failed");
-        return;
-    }
-
-    uint8_t rsp[96];
-    memcpy(rsp, sig, 64);
-    memcpy(rsp + 64, rk, 32);
-    send_frame(fd, seq, HWP_MSG_SIGN_RSP, rsp, 96);
-    fprintf(stderr, "[hwp] SIGN_RSP sent\n");
+static HwpUiResult cb_review_output(uint16_t idx, uint16_t total,
+                                     const char* addr, uint64_t value,
+                                     void* ctx) {
+    (void)ctx;
+    fprintf(stderr, "[hwp] review output %u/%u: %s  (%llu zat)\n",
+            idx, total, addr, (unsigned long long)value);
+    return HWP_UI_OK;
 }
 
-/* ── Transparent digest verification handlers (v3) ─────────────── */
-
-static void handle_transparent_input(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
-{
-    if (payload_len < HWP_TX_OUTPUT_HEADER) {
-        send_error(fd, seq, HWP_ERR_BAD_FRAME, "transparent input too short");
-        return;
-    }
-
-    uint16_t input_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
-    uint16_t total_inputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
-    const uint8_t *data   = payload + HWP_TX_OUTPUT_HEADER;
-    uint16_t data_len     = payload_len - HWP_TX_OUTPUT_HEADER;
-
-    OrchardSignerError serr;
-
-    /* First transparent input triggers begin_transparent on the signer */
-    if (input_index == 0 && signer_ctx.state == SIGNER_RECEIVING_ACTIONS) {
-        serr = orchard_signer_begin_transparent(&signer_ctx, total_inputs, 0);
-        if (serr != SIGNER_OK) {
-            send_error(fd, seq, HWP_ERR_INVALID_STATE, "cannot begin transparent");
-            orchard_signer_reset(&signer_ctx);
-            return;
-        }
-        fprintf(stderr, "[hwp] Transparent verification started (%d inputs)\n", total_inputs);
-    }
-
-    /* Sentinel: index == total_inputs → verify digest */
-    if (input_index == total_inputs) {
-        if (data_len != 32) {
-            send_error(fd, seq, HWP_ERR_BAD_FRAME, "transparent sentinel must be 32 bytes");
-            orchard_signer_reset(&signer_ctx);
-            return;
-        }
-
-        serr = orchard_signer_verify_transparent(&signer_ctx, data);
-        if (serr == SIGNER_ERR_TRANSPARENT_MISMATCH) {
-            fprintf(stderr, "[hwp] Transparent digest MISMATCH\n");
-            send_error(fd, seq, HWP_ERR_TRANSPARENT_DIGEST_MISMATCH, "transparent digest mismatch");
-            return;
-        }
-        if (serr != SIGNER_OK) {
-            fprintf(stderr, "[hwp] Transparent verify failed (err=%d)\n", serr);
-            send_error(fd, seq, HWP_ERR_INVALID_STATE, "transparent verify failed");
-            orchard_signer_reset(&signer_ctx);
-            return;
-        }
-
-        fprintf(stderr, "[hwp] Transparent digest verified\n");
-        send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
-        return;
-    }
-
-    /* Normal input data */
-    serr = orchard_signer_feed_transparent_input(&signer_ctx, data, data_len);
-    if (serr != SIGNER_OK) {
-        const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected transparent input" : "invalid transparent input";
-        HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME;
-        send_error(fd, seq, code, msg);
-        orchard_signer_reset(&signer_ctx);
-        return;
-    }
-
-    fprintf(stderr, "[hwp] Transparent input %d/%d hashed\n", input_index + 1, total_inputs);
-    send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+static HwpUiResult cb_confirm_tx(uint64_t amount, uint64_t fee,
+                                  const char* recipient, void* ctx) {
+    (void)ctx;
+    fprintf(stderr, "[hwp] confirm tx: %llu zat → %s (fee %llu)\n",
+            (unsigned long long)amount, recipient, (unsigned long long)fee);
+    return HWP_UI_OK;
 }
 
-static void handle_transparent_output(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
-{
-    if (payload_len < HWP_TX_OUTPUT_HEADER) {
-        send_error(fd, seq, HWP_ERR_BAD_FRAME, "transparent output too short");
-        return;
-    }
-
-    uint16_t output_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
-    uint16_t total_outputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
-    const uint8_t *data    = payload + HWP_TX_OUTPUT_HEADER;
-    uint16_t data_len      = payload_len - HWP_TX_OUTPUT_HEADER;
-
-    /* Set the expected outputs count on first output message */
-    if (output_index == 0 && signer_ctx.transparent_outputs_expected == 0) {
-        signer_ctx.transparent_outputs_expected = total_outputs;
-        fprintf(stderr, "[hwp] Expecting %d transparent outputs\n", total_outputs);
-    }
-
-    OrchardSignerError serr = orchard_signer_feed_transparent_output(&signer_ctx, data, data_len);
-    if (serr != SIGNER_OK) {
-        const char *msg = (serr == SIGNER_ERR_BAD_STATE) ? "unexpected transparent output" : "invalid transparent output";
-        HwpErrorCode code = (serr == SIGNER_ERR_BAD_STATE) ? HWP_ERR_INVALID_STATE : HWP_ERR_BAD_FRAME;
-        send_error(fd, seq, code, msg);
-        orchard_signer_reset(&signer_ctx);
-        return;
-    }
-
-    fprintf(stderr, "[hwp] Transparent output %d/%d hashed\n", output_index + 1, total_outputs);
-    send_frame(fd, seq, HWP_MSG_TX_OUTPUT_ACK, NULL, 0);
+static void cb_network_error(const char* msg, bool device_testnet, void* ctx) {
+    (void)ctx;
+    fprintf(stderr, "[hwp] network mismatch (testnet=%d): %s\n",
+            device_testnet, msg);
 }
 
-static void handle_transparent_sign_req(int fd, uint8_t seq, const uint8_t *payload, uint16_t payload_len)
-{
-    if (payload_len < HWP_TX_OUTPUT_HEADER) {
-        send_error(fd, seq, HWP_ERR_BAD_FRAME, "transparent sign req too short");
-        return;
+static void cb_phase(HwpPhase phase, uint16_t idx, uint16_t total, void* ctx) {
+    (void)ctx;
+    fprintf(stderr, "[hwp] phase=%d %u/%u\n", phase, idx, total);
+}
+
+static void cb_progress(uint8_t pct, const char* label, void* ctx) {
+    (void)ctx;
+    if(pct % 10 == 0) {
+        fprintf(stderr, "[hwp] progress %3u%% %s\n", pct, label);
     }
+}
 
-    uint16_t input_index  = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
-    uint16_t total_inputs = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
-    const uint8_t *input_data = payload + HWP_TX_OUTPUT_HEADER;
-    uint16_t input_data_len   = payload_len - HWP_TX_OUTPUT_HEADER;
+/* ── Key material derivation (once per process) ───────────────────── */
 
-    fprintf(stderr, "[hwp] TRANSPARENT_SIGN_REQ (input %d/%d)\n", input_index + 1, total_inputs);
-
-    if (!signer_ctx.transparent_verified) {
-        send_error(fd, seq, HWP_ERR_INVALID_STATE, "transparent not verified");
-        return;
-    }
-
-    /* Compute per-input transparent sighash on-device */
-    uint8_t per_input_sighash[32];
-    zip244_transparent_per_input_sighash(
-        &signer_ctx.transparent_state,
-        input_index,
-        input_data,
-        input_data_len,
-        0x01, /* SIGHASH_ALL */
-        per_input_sighash);
-
-    /* Derive transparent spending key via BIP-32 */
-    uint32_t coin_type = signer_ctx.coin_type ? signer_ctx.coin_type : 1;
+static void derive_keys(Session* s) {
     uint8_t seed[64];
     wallet_test_get_seed(seed);
 
-    uint8_t t_sk[32], t_pubkey[33];
-    if (bip32_derive_transparent_sk(seed, coin_type, t_sk, t_pubkey) != 0) {
-        memzero(seed, sizeof(seed));
-        send_error(fd, seq, HWP_ERR_SIGN_FAILED, "BIP-32 derivation failed");
-        return;
-    }
+    /* Orchard ZIP-32 derivation: sk → ask/nk/rivk → ak. */
+    uint8_t sk[32];
+    orchard_derive_account_sk(seed, s->coin_type, 0, sk);
+    orchard_derive_keys(sk, s->ask, s->nk, s->rivk);
+    memzero(sk, sizeof(sk));
+    redpallas_derive_ak(s->ask, s->ak);
+
+    /* BIP-32 transparent: m/44'/coin_type'/0'/0/0. */
+    bip32_derive_transparent_sk(seed, s->coin_type, s->t_sk, s->t_pubkey);
+
     memzero(seed, sizeof(seed));
-
-    /* Sign with ECDSA */
-    uint8_t compact_sig[64];
-    if (secp256k1_ecdsa_sign_digest(t_sk, per_input_sighash, compact_sig) != 0) {
-        memzero(t_sk, sizeof(t_sk));
-        send_error(fd, seq, HWP_ERR_SIGN_FAILED, "ECDSA signing failed");
-        return;
-    }
-    memzero(t_sk, sizeof(t_sk));
-
-    /* DER encode */
-    uint8_t der_sig[72];
-    size_t der_len = secp256k1_sig_to_der(compact_sig, der_sig);
-
-    /* Build response: der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33] */
-    uint8_t rsp[HWP_TRANSPARENT_SIGN_RSP_MAX];
-    rsp[0] = (uint8_t)der_len;
-    memcpy(rsp + 1, der_sig, der_len);
-    rsp[1 + der_len] = 0x01; /* SIGHASH_ALL */
-    memcpy(rsp + 1 + der_len + 1, t_pubkey, 33);
-
-    size_t rsp_len = 1 + der_len + 1 + 33;
-    send_frame(fd, seq, HWP_MSG_TRANSPARENT_SIGN_RSP, rsp, (uint16_t)rsp_len);
-
-    fprintf(stderr, "[hwp] TRANSPARENT_SIGN_RSP sent (DER %zu bytes)\n", der_len);
-    memzero(compact_sig, sizeof(compact_sig));
-    memzero(per_input_sighash, sizeof(per_input_sighash));
+    fprintf(stderr, "[wallet] keys derived (coin_type=%u)\n",
+            (unsigned)s->coin_type);
 }
 
-static void handle_abort(void)
-{
-    if (signer_ctx.state != SIGNER_IDLE) {
-        fprintf(stderr, "[hwp] Session aborted\n");
-        orchard_signer_reset(&signer_ctx);
-    }
-}
+/* ── Main ─────────────────────────────────────────────────────────── */
 
-/* ── Main ────────────────────────────────────────────────────────── */
+static volatile sig_atomic_t s_shutdown = 0;
+static void on_sigint(int sig) { (void)sig; s_shutdown = 1; }
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char* argv[]) {
     uint16_t port = DEFAULT_PORT;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+    /* Default to mainnet so the SDK's integration tests (which set
+     * COIN_TYPE_MAINNET in the synthetic TxMeta they build for the
+     * sighash KAT) work without override. Spawn a second instance with
+     * --coin 1 for testnet coverage. */
+    uint32_t coin_type = 133;
+    for(int i = 1; i < argc; i++) {
+        if(strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = (uint16_t)atoi(argv[++i]);
+        } else if(strcmp(argv[i], "--coin") == 0 && i + 1 < argc) {
+            coin_type = (uint32_t)atoi(argv[++i]);
         }
     }
 
-    signal(SIGPIPE, SIG_IGN); /* ignore broken pipe */
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
 
     wallet_test_init();
-    orchard_signer_init(&signer_ctx);
 
     int server_fd = tcp_listen(port);
-    if (server_fd < 0) return 1;
-    fprintf(stderr, "[hwp] Virtual device listening on port %d\n", port);
+    if(server_fd < 0) return 1;
+    fprintf(stderr, "[hwp] Virtual device listening on port %d (coin_type=%u)\n",
+            port, (unsigned)coin_type);
 
-    for (;;) {
+    while(!s_shutdown) {
         int client_fd = tcp_accept(server_fd);
-        if (client_fd < 0) continue;
+        if(client_fd < 0) continue;
         fprintf(stderr, "[hwp] Client connected\n");
 
-        /* Send PING on connect (like ESP32 on USB host connect) */
-        orchard_signer_reset(&signer_ctx);
-        send_ping(client_fd);
+        Session s = {
+            .client_fd = client_fd,
+            .client_disconnected = false,
+            .coin_type = coin_type,
+            .testnet = (coin_type == 1),
+        };
+        orchard_signer_init(&s.signer);
+        s.signer.coin_type = coin_type;
+        derive_keys(&s);
 
-        /* Frame processing loop */
-        for (;;) {
-            HwpFeedResult res = tcp_recv_frame(client_fd, &rx_parser);
-            if (res == HWP_FEED_CRC_ERROR) {
-                send_error(client_fd, rx_parser.frame.seq, HWP_ERR_BAD_FRAME, "CRC mismatch");
-                continue;
-            }
-            if (res != HWP_FEED_FRAME_READY) break; /* connection closed */
+        HwpDispatcher d = {
+            .io = {
+                .serial_drain = cb_serial_drain,
+                .serial_send  = cb_serial_send,
+                .get_tick_ms  = cb_tick_ms,
+                .sleep_ms     = cb_sleep_ms,
+                .should_exit  = cb_should_exit,
+            },
+            .ui = {
+                .review_output = cb_review_output,
+                .confirm_tx    = cb_confirm_tx,
+                .network_error = cb_network_error,
+                .phase_update  = cb_phase,
+                .progress      = cb_progress,
+            },
+            .keys = {
+                .ak       = s.ak,
+                .nk       = s.nk,
+                .rivk     = s.rivk,
+                .ask      = s.ask,
+                .t_sk     = s.t_sk,
+                .t_pubkey = s.t_pubkey,
+            },
+            .signer    = &s.signer,
+            .testnet   = s.testnet,
+            .user_ctx  = &s,
+        };
 
-            HwpFrame *f = &rx_parser.frame;
-            fprintf(stderr, "[hwp] Frame: type=0x%02x seq=%d len=%d\n", f->type, f->seq, f->payload_len);
-
-            switch (f->type) {
-            case HWP_MSG_PING:
-                send_frame(client_fd, f->seq, HWP_MSG_PONG, NULL, 0);
-                break;
-            case HWP_MSG_PONG:
-                fprintf(stderr, "[hwp] Handshake complete\n");
-                break;
-            case HWP_MSG_FVK_REQ:
-                handle_fvk_req(client_fd, f->seq, f->payload, f->payload_len);
-                break;
-            case HWP_MSG_TX_OUTPUT:
-                handle_tx_output(client_fd, f->seq, f->payload, f->payload_len);
-                break;
-            case HWP_MSG_SIGN_REQ:
-                handle_sign_req(client_fd, f->seq, f->payload, f->payload_len);
-                break;
-            case HWP_MSG_ABORT:
-                handle_abort();
-                break;
-            case HWP_MSG_TX_TRANSPARENT_INPUT:
-                handle_transparent_input(client_fd, f->seq, f->payload, f->payload_len);
-                break;
-            case HWP_MSG_TX_TRANSPARENT_OUTPUT:
-                handle_transparent_output(client_fd, f->seq, f->payload, f->payload_len);
-                break;
-            case HWP_MSG_TRANSPARENT_SIGN_REQ:
-                handle_transparent_sign_req(client_fd, f->seq, f->payload, f->payload_len);
-                break;
-            default:
-                send_error(client_fd, f->seq, HWP_ERR_UNKNOWN, "unsupported msg type");
-                break;
-            }
-        }
+        hwp_dispatcher_run(&d);
 
         tcp_close(client_fd);
-        orchard_signer_reset(&signer_ctx);
+        orchard_signer_reset(&s.signer);
+        memzero(s.ask, sizeof(s.ask));
+        memzero(s.t_sk, sizeof(s.t_sk));
         fprintf(stderr, "[hwp] Client disconnected\n");
     }
 
+    tcp_close(server_fd);
     return 0;
 }
