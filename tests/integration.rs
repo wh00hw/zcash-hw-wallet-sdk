@@ -121,6 +121,12 @@ const NOTE_COMMIT_UA_MAINNET: &str =
 /// fields (cv_net, rk, ephemeral_key, enc/out ciphertexts) are still
 /// filler — they ride through the ZIP-244 hash unverified, which is
 /// what these tests are exercising.
+///
+/// `memo` and `esk` are left `None` so `serialize_v5()` returns `None`
+/// and `DeviceSigner` falls back to the 903-byte cmx-only payload.
+/// Memo verification on the device requires a recomputable
+/// `enc_ciphertext`, which the filler bytes above don't satisfy — the
+/// v5 path is exercised in the libzcash-orchard-c signer tests instead.
 fn build_test_action_data() -> ActionData {
     ActionData {
         cv_net: [0x01; 32],
@@ -133,6 +139,8 @@ fn build_test_action_data() -> ActionData {
         recipient: NOTE_COMMIT_RECIPIENT,
         value: NOTE_COMMIT_VALUE,
         rseed: NOTE_COMMIT_RSEED,
+        memo: None,
+        esk: None,
     }
 }
 
