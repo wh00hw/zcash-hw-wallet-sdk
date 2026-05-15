@@ -231,6 +231,21 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
         let pre_pczt = pczt::Pczt::parse(&pczt_bytes)
             .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse: {:?}", e)))?;
 
+        // Fetch the device's Orchard OVK for memo recovery. We use the
+        // sender's OutgoingViewingKey to trial-decrypt out_ciphertext on
+        // each action, which recovers the unencrypted note plaintext
+        // (including memo) that we then forward to the device so it can
+        // verify enc_ciphertext byte-for-byte. If the device cannot supply
+        // an FVK we proceed without — the workflow falls back to v4
+        // cmx-only verification for actions whose memo we can't recover.
+        let ovk_for_recovery: Option<orchard::keys::OutgoingViewingKey> =
+            match self.signer.export_fvk() {
+                Ok(fvk) => fvk
+                    .to_orchard_fvk()
+                    .map(|f| f.to_ovk(orchard::keys::Scope::External)),
+                Err(_) => None,
+            };
+
         // Use low_level_signer to access the parsed orchard::pczt::Bundle
         // for reading alpha, rk, and action data through public getters.
         let mut actions_to_sign: Vec<(usize, [u8; 32])> = Vec::new();
@@ -289,6 +304,37 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                     })?;
 
                     let enc_note = action.output().encrypted_note();
+
+                    // Recover the 512-byte memo plaintext by trial-decrypting
+                    // out_ciphertext with the sender's OVK, then trial-
+                    // decrypting enc_ciphertext with the recovered (esk,
+                    // pk_d). Sent to the device alongside the action so it
+                    // can recompute enc_ciphertext on-chip and reject any
+                    // memo substitution (the cmx defence binds value/recipient
+                    // but is silent about memo bytes).
+                    //
+                    // For outputs constructed with OVK::None — explicitly
+                    // unrecoverable by the sender — we leave memo as None
+                    // and fall back to v4 cmx-only verification for that
+                    // action. esk is not transmitted: per ZIP-212 it is
+                    // a function of (rseed, rho) and the device re-derives
+                    // it on-chip.
+                    let memo: Option<[u8; 512]> = ovk_for_recovery
+                        .as_ref()
+                        .and_then(|ovk| {
+                            use orchard::note_encryption::OrchardDomain;
+                            use ::zcash_note_encryption::try_output_recovery_with_ovk;
+                            let domain = OrchardDomain::for_pczt_action(action);
+                            try_output_recovery_with_ovk(
+                                &domain,
+                                ovk,
+                                action,
+                                action.cv_net(),
+                                &enc_note.out_ciphertext,
+                            )
+                            .map(|(_note, _addr, memo)| memo)
+                        });
+
                     all_actions_data.push(ActionData {
                         cv_net: action.cv_net().to_bytes(),
                         nullifier: action.spend().nullifier().to_bytes(),
@@ -300,6 +346,10 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                         recipient,
                         value,
                         rseed,
+                        memo,
+                        // esk is derived on-device from (rseed, rho) per
+                        // ZIP-212; not transmitted over the wire.
+                        esk: None,
                     });
                 }
                 Ok(())

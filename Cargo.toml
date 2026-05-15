@@ -51,6 +51,10 @@ pczt = { version = "0.5", features = ["io-finalizer", "prover", "signer", "spend
 orchard = "0.12"
 reddsa = "0.5"
 ff = "0.13"
+# Used in workflow.rs to trial-decrypt out_ciphertext / enc_ciphertext with
+# the device's OVK so we can forward the memo plaintext to the device for
+# on-chip enc_ciphertext recomputation (v5 memo-verifying protocol).
+zcash_note_encryption = "0.4"
 secp256k1 = "0.29"
 zcash_address = "0.10"
 zcash_primitives = "0.26"

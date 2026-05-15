@@ -2743,6 +2743,7 @@ dependencies = [
  "tracing",
  "ur",
  "zcash_address",
+ "zcash_note_encryption",
  "zcash_primitives",
  "zcash_protocol",
  "zeroize",

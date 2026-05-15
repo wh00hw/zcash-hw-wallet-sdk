@@ -241,17 +241,22 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
             info!("Transparent digest verified — device confirmed match.");
         }
 
-        // 3. Send each Orchard action's ZIP-244 data (v4 = 903 bytes incl.
-        //    note plaintext for on-device cmx recomputation).
+        // 3. Send each Orchard action's ZIP-244 data. Prefer the v5 wire
+        //    format (1447 bytes incl. memo + esk) so the device can
+        //    recompute enc_ciphertext on-chip and reject any host that
+        //    embeds a different memo on chain than what the user is
+        //    shown. Fall back to v4 (903 bytes, cmx-only) if memo/esk
+        //    were not recoverable for this action (OVK-None output).
         for (i, action) in actions.iter().enumerate() {
-            let output_data = action.serialize();
+            let output_data = action.serialize_v5().unwrap_or_else(|| action.serialize());
             self.codec
                 .send_tx_output(i as u16, total_actions, &output_data)?;
             debug!(
-                "TxOutput {}/{} sent ({} bytes), device ACK received",
+                "TxOutput {}/{} sent ({} bytes, {}), device ACK received",
                 i + 1,
                 total_actions,
-                output_data.len()
+                output_data.len(),
+                if output_data.len() == 1447 { "v5" } else { "v4" },
             );
         }
 

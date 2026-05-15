@@ -186,10 +186,25 @@ pub struct ActionData {
     pub value: u64,
     /// Output-note random seed.
     pub rseed: [u8; 32],
+    /// Output-note memo plaintext (ZIP-302 conventions, 512 bytes).
+    ///
+    /// Populated when the workflow has recovered it from `out_ciphertext` via
+    /// the sender's outgoing viewing key. `None` for outputs sent with
+    /// `OVK::None` (deliberately unrecoverable by the sender) — in that case
+    /// the v5 memo-verifying wire format is not used for this action and the
+    /// device falls back to cmx-only verification (v4 behaviour).
+    pub memo: Option<[u8; 512]>,
+    /// Ephemeral secret key for this output (32 bytes, repr of a Pallas
+    /// scalar). Derived deterministically from `rseed || rho` per
+    /// ZIP-212 / Orchard protocol; carried separately because the orchard
+    /// crate keeps the `Note::esk()` accessor `pub(crate)`.
+    pub esk: Option<[u8; 32]>,
 }
 
 impl ActionData {
     /// Serialize to the v4 wire format for TxOutput messages (903 bytes).
+    /// Used when memo/esk are unavailable (OVK-None output) — cmx
+    /// verification only.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
             32 + 32 + 32 + 32 + 32
@@ -209,6 +224,22 @@ impl ActionData {
         buf.extend_from_slice(&self.value.to_le_bytes());
         buf.extend_from_slice(&self.rseed);
         buf
+    }
+
+    /// Serialize to the v5 wire format for TxOutput messages (1447 bytes).
+    /// Adds memo[512] + esk[32] after the v4 payload so the device can
+    /// recompute `enc_ciphertext` byte-for-byte and reject any host that
+    /// embeds a different memo on chain from the one shown to the user.
+    /// Returns `None` if either `memo` or `esk` is missing (caller falls
+    /// back to `serialize()` for that action).
+    pub fn serialize_v5(&self) -> Option<Vec<u8>> {
+        let memo = self.memo?;
+        let esk = self.esk?;
+        let mut buf = self.serialize();
+        buf.reserve(512 + 32);
+        buf.extend_from_slice(&memo);
+        buf.extend_from_slice(&esk);
+        Some(buf)
     }
 }
 

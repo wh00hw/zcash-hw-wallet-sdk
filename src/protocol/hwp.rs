@@ -15,9 +15,12 @@ pub const HWP_HEADER_SIZE: usize = 6;
 pub const HWP_CRC_SIZE: usize = 2;
 /// Maximum payload size per frame.
 ///
-/// Set to 1024 to accommodate full action data for on-device sighash
-/// verification (ZIP-244 action data is 820 bytes + 4 byte TxOutput header).
-pub const HWP_MAX_PAYLOAD: usize = 1024;
+/// Bumped from 1024 to 2048 for HWP v5: the v5 action payload carries the
+/// full unencrypted note plaintext (action 820 + recipient 43 + value 8 +
+/// rseed 32 + memo 512 = 1415 bytes) so the device can recompute
+/// `enc_ciphertext` on-chip and reject memo substitution. Must match the
+/// device-side `HWP_MAX_PAYLOAD` in `libzcash-orchard-c/include/hwp.h`.
+pub const HWP_MAX_PAYLOAD: usize = 2048;
 pub const HWP_MAX_RECIPIENT: usize = 127;
 /// Maximum number of keepalive (PING) messages tolerated before aborting.
 /// Prevents infinite loops if a device keeps sending PINGs without progressing.
