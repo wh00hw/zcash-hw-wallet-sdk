@@ -473,13 +473,36 @@ The wallet application drives network selection by passing `coin_type` in HWP pr
 1. **`PcztHardwareSigning::new(signer, Network::TestNetwork)`** — the workflow requires an explicit `Network` parameter
 2. **`export_fvk(coin_type)`** — the SDK sends `coin_type` in `FvkReq` payload; the device derives keys from `m/32'/coin_type'/account'`
 3. **`TxMeta`** carries `coin_type` (bytes 125-128) — the device validates that it matches the `coin_type` from `FvkReq`
-4. **Pre-proof validation** — the SDK rejects non-Orchard branch IDs (pre-Nu5) before expensive Halo2 proof generation
+4. **Pre-proof validation** — the SDK rejects branch IDs that predate the Orchard protocol (pre-Nu5) before expensive Halo2 proof generation, and rejects v6 transactions whose branch ID predates NU6.3
 
 If a mismatch is detected (e.g., `FvkReq(coin_type=133)` followed by `TxMeta(coin_type=1)`), the device returns `NetworkMismatch` (error 0x05).
 
-The `coin_type` extension in TxMeta (bytes 125-128) is **not** part of the ZIP-244 sighash computation — it is appended after the 125-byte core fields for network validation only.
+The `coin_type` extension in TxMeta (the trailing 4 bytes: 125-128 in the v5 layout, 166-169 in the v6 layout) is **not** part of the ZIP-244 sighash computation — it is appended after the core fields for network validation only.
 
-**Note:** `consensus_branch_id` values (e.g., Nu5 = `0xc2d6d0b4`) are identical on mainnet and testnet. Only `coin_type` (133 vs 1) reliably distinguishes the networks, because it determines the ZIP-32 key derivation path.
+**Note:** `consensus_branch_id` values (e.g., Nu5 = `0xc2d6d0b4`, Nu6.3 = `0x37a5165b`) are identical on mainnet and testnet. Only `coin_type` (133 vs 1) reliably distinguishes the networks, because it determines the ZIP-32 key derivation path.
+
+### NU6.3 / Ironwood (v6 transactions)
+
+From NU6.3 a transaction may carry actions in two Orchard-protocol pools: the
+**sealed Orchard pool** (spend-only turnstile withdrawals, cross-address
+transfers disabled by consensus) and the new **Ironwood pool** (ZIP 258, using
+V3 quantum-recoverable note plaintexts per ZIP 2005). The SDK handles both:
+
+- **TxMeta v6 layout (170 bytes)**: inserts `ironwood_flags[1] ||
+  ironwood_value_balance[8 LE] || ironwood_anchor[32]` after the Orchard
+  anchor. The device discriminates v5/v6 by payload size. Under v6 the anchors
+  are *not* part of the effects digest (they move to the authorizing-data
+  commitment), and the sighash tree gains a fifth leaf
+  (`ZTxIdIronwd_H_v6`-personalized) after the Orchard one
+  (`ZTxIdOrchardH_v6`).
+- **Pool-tagged actions**: every v6 action payload is prefixed with one pool
+  byte (`0x00` Orchard, `0x01` Ironwood) so the device hashes it into the
+  correct pool digest tree and verifies the output note under the correct
+  note-plaintext version (V2 lead byte `0x02` vs V3 lead byte `0x03`, with the
+  ZIP-2005 rcm derivation for V3).
+- **Signing**: spends in both pools use the same RedPallas spend-authorization
+  scheme; the workflow routes signatures back via
+  `apply_orchard_signature` / `apply_ironwood_signature` per pool.
 
 ## On-Device Verification — five composed invariants
 
@@ -677,8 +700,8 @@ Once a new pczt release is published, the `[patch.crates-io]` section in `Cargo.
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `pczt` | 0.5 | PCZT roles (prover, signer, extractor) |
-| `orchard` | 0.12 | Orchard circuit proving/verifying keys |
+| `pczt` | 0.7 | PCZT roles (prover, signer, extractor) — Ironwood-aware (PCZT v2) |
+| `orchard` | 0.15.0-pre.2 | Orchard-protocol circuit keys, Ironwood pool, V3 notes |
 | `reddsa` | 0.5 | RedPallas signature verification |
 | `secp256k1` | 0.29 | ECDSA transparent signature parsing |
 | `ff` | 0.13 | Finite field traits (alpha serialization) |

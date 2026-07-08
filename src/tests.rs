@@ -371,3 +371,84 @@ mod qr_tests {
         assert_eq!(reassembled, data);
     }
 }
+
+// ── NU6.3 / Ironwood wire-format tests ──────────────────────────────────
+
+mod ironwood_wire_tests {
+    use crate::types::{ActionData, ShieldedPoolKind, TxMeta};
+
+    fn sample_meta(version: u32) -> TxMeta {
+        TxMeta {
+            version,
+            version_group_id: 0xD884B698,
+            consensus_branch_id: 0x37a5165b, // NU6.3
+            lock_time: 7,
+            expiry_height: 4_200_000,
+            orchard_flags: 0x03,
+            value_balance: -123_456_789,
+            anchor: [0xA1; 32],
+            ironwood_flags: 0x07,
+            ironwood_value_balance: 123_456_789,
+            ironwood_anchor: [0xB2; 32],
+            transparent_sig_digest: [0xC3; 32],
+            sapling_digest: [0xD4; 32],
+            coin_type: 133,
+        }
+    }
+
+    #[test]
+    fn tx_meta_v5_layout_is_129_bytes_without_ironwood_section() {
+        let meta = sample_meta(0x8000_0005);
+        assert!(!meta.is_v6());
+        let bytes = meta.serialize();
+        assert_eq!(bytes.len(), 129);
+        // transparent_sig_digest directly after the Orchard anchor
+        assert_eq!(&bytes[61..93], &[0xC3; 32]);
+        assert_eq!(&bytes[125..129], &133u32.to_le_bytes());
+    }
+
+    #[test]
+    fn tx_meta_v6_layout_is_170_bytes_with_ironwood_section() {
+        let meta = sample_meta(0x8000_0006);
+        assert!(meta.is_v6());
+        let bytes = meta.serialize();
+        assert_eq!(bytes.len(), 170);
+        // Ironwood section: flags[1] || value_balance[8] || anchor[32] at 61
+        assert_eq!(bytes[61], 0x07);
+        assert_eq!(&bytes[62..70], &123_456_789i64.to_le_bytes());
+        assert_eq!(&bytes[70..102], &[0xB2; 32]);
+        assert_eq!(&bytes[102..134], &[0xC3; 32]);
+        assert_eq!(&bytes[166..170], &133u32.to_le_bytes());
+    }
+
+    fn sample_action(pool: ShieldedPoolKind, memo: Option<[u8; 512]>) -> ActionData {
+        ActionData {
+            pool,
+            cv_net: [1; 32],
+            nullifier: [2; 32],
+            rk: [3; 32],
+            cmx: [4; 32],
+            ephemeral_key: [5; 32],
+            enc_ciphertext: vec![6; 580],
+            out_ciphertext: vec![7; 80],
+            recipient: [8; 43],
+            value: 42,
+            rseed: [9; 32],
+            memo,
+            esk: None,
+        }
+    }
+
+    #[test]
+    fn action_v6_wire_prefixes_pool_byte() {
+        let a = sample_action(ShieldedPoolKind::Ironwood, Some([0xF6; 512]));
+        let bytes = a.serialize_v6();
+        assert_eq!(bytes.len(), 1416); // pool(1) + v4(903) + memo(512)
+        assert_eq!(bytes[0], 0x01);
+
+        let b = sample_action(ShieldedPoolKind::Orchard, None);
+        let bytes = b.serialize_v6();
+        assert_eq!(bytes.len(), 904); // pool(1) + v4(903), cmx-only
+        assert_eq!(bytes[0], 0x00);
+    }
+}

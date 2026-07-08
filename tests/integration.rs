@@ -66,6 +66,11 @@ fn build_test_tx_meta(coin_type: u32) -> TxMeta {
         orchard_flags: 0x03, // spends + outputs enabled
         value_balance: 0,
         anchor: [0xAA; 32],
+        // Ironwood section: unused for v5 fixtures (only serialized in the
+        // 170-byte v6 TxMeta layout).
+        ironwood_flags: 0,
+        ironwood_value_balance: 0,
+        ironwood_anchor: [0u8; 32],
         transparent_sig_digest: blake2b_personal(b"ZTxIdTranspaHash", &[]),
         sapling_digest: blake2b_personal(b"ZTxIdSaplingHash", &[]),
         coin_type,
@@ -129,6 +134,7 @@ const NOTE_COMMIT_UA_MAINNET: &str =
 /// v5 path is exercised in the libzcash-orchard-c signer tests instead.
 fn build_test_action_data() -> ActionData {
     ActionData {
+        pool: zcash_hw_wallet_sdk::types::ShieldedPoolKind::Orchard,
         cv_net: [0x01; 32],
         nullifier: NOTE_COMMIT_RHO,
         rk: [0x03; 32],

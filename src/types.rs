@@ -148,6 +148,33 @@ impl ExportedFvk {
     }
 }
 
+/// The shielded value pool an action belongs to (NU6.3 / Ironwood).
+///
+/// Wire encoding: a single byte prefixed to each action payload in the v6
+/// transaction wire format (`0x00` = Orchard, `0x01` = Ironwood). v5
+/// transactions carry no pool byte — every action is implicitly Orchard.
+///
+/// The pool also selects the note-plaintext version the device uses when
+/// recomputing cmx / enc_ciphertext: Orchard notes are ZIP-212 V2 (lead byte
+/// 0x02, rcm = PRF^expand(rseed, [0x05] || rho)), Ironwood notes are ZIP-2005
+/// V3 (lead byte 0x03, quantum-recoverable rcm bound to all note fields).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShieldedPoolKind {
+    /// The legacy Orchard pool. Sealed at NU6.3: spend-only, cross-address
+    /// transfers disabled, value exits through the turnstile.
+    Orchard = 0x00,
+    /// The Ironwood pool introduced by NU6.3 (ZIP 258), using the fixed
+    /// post-NU6.2 circuit and V3 note plaintexts.
+    Ironwood = 0x01,
+}
+
+impl ShieldedPoolKind {
+    /// The wire byte for this pool.
+    pub fn to_byte(self) -> u8 {
+        self as u8
+    }
+}
+
 /// Serialized action data for on-device sighash verification (HWP v2).
 ///
 /// Contains all the fields the device needs to independently compute
@@ -166,6 +193,10 @@ impl ExportedFvk {
 /// on-chain effect of the signed transaction.
 #[derive(Debug, Clone)]
 pub struct ActionData {
+    /// The shielded pool this action belongs to. Determines the digest tree
+    /// the device hashes it into and the note-plaintext version used for
+    /// on-device cmx / enc_ciphertext recomputation.
+    pub pool: ShieldedPoolKind,
     /// Value commitment (32 bytes).
     pub cv_net: [u8; 32],
     /// Nullifier (32 bytes).
@@ -241,6 +272,23 @@ impl ActionData {
         buf.extend_from_slice(&esk);
         Some(buf)
     }
+
+    /// Serialize to the v6 wire format for TxOutput messages: a 1-byte pool
+    /// tag (`0x00` Orchard, `0x01` Ironwood) followed by the memo-verifying
+    /// payload (v4 payload + memo[512], 1416 bytes total) or, when the memo
+    /// is unavailable, the cmx-only v4 payload (904 bytes total). esk is
+    /// never transmitted — the device derives it from (rseed, rho). Only
+    /// used for v6 (NU6.3+) transactions; the device strips the pool tag
+    /// and discriminates the format by the remaining payload size.
+    pub fn serialize_v6(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 903 + 512);
+        buf.push(self.pool.to_byte());
+        buf.extend_from_slice(&self.serialize());
+        if let Some(memo) = self.memo {
+            buf.extend_from_slice(&memo);
+        }
+        buf
+    }
 }
 
 /// Transparent input data for on-device sighash verification (HWP v3).
@@ -312,17 +360,28 @@ impl TransparentOutputData {
 
 /// Transaction metadata for on-device ZIP-244 sighash computation.
 ///
-/// Contains the header fields and Orchard bundle metadata that the device
+/// Contains the header fields and shielded bundle metadata that the device
 /// needs (together with action data) to independently compute the sighash.
 ///
-/// Wire format (129 bytes):
+/// v5 wire format (129 bytes):
 /// `version[4 LE] || version_group_id[4 LE] || consensus_branch_id[4 LE] ||
 ///  lock_time[4 LE] || expiry_height[4 LE] ||
 ///  orchard_flags[1] || value_balance[8 LE signed] || anchor[32] ||
 ///  transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`
 ///
-/// The first 125 bytes are used for ZIP-244 sighash computation.
-/// The trailing `coin_type` is for network discrimination (not hashed).
+/// v6 wire format (170 bytes, NU6.3 / Ironwood): inserts an Ironwood bundle
+/// section after the Orchard one:
+/// `version[4 LE] || version_group_id[4 LE] || consensus_branch_id[4 LE] ||
+///  lock_time[4 LE] || expiry_height[4 LE] ||
+///  orchard_flags[1] || value_balance[8 LE signed] || anchor[32] ||
+///  ironwood_flags[1] || ironwood_value_balance[8 LE signed] || ironwood_anchor[32] ||
+///  transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`
+///
+/// The device discriminates the two layouts by payload size. All bytes
+/// except the trailing `coin_type` feed ZIP-244 sighash computation. Note
+/// that under the v6 transaction format the anchors are NOT part of the
+/// txid/effects digest (they move to the authorizing-data commitment); they
+/// are still carried for display and consistency checks.
 #[derive(Debug, Clone)]
 pub struct TxMeta {
     pub version: u32,
@@ -333,6 +392,12 @@ pub struct TxMeta {
     pub orchard_flags: u8,
     pub value_balance: i64,
     pub anchor: [u8; 32],
+    /// Ironwood bundle flag byte (v6 only; bit 2 = enableCrossAddress).
+    pub ironwood_flags: u8,
+    /// Ironwood bundle net value balance in zatoshis (v6 only).
+    pub ironwood_value_balance: i64,
+    /// Ironwood bundle anchor (v6 only).
+    pub ironwood_anchor: [u8; 32],
     /// Pre-computed transparent signature digest (ZIP-244 S.2).
     pub transparent_sig_digest: [u8; 32],
     /// Pre-computed sapling digest (ZIP-244 T.3).
@@ -342,12 +407,17 @@ pub struct TxMeta {
 }
 
 impl TxMeta {
-    /// Serialize to the 129-byte wire format for TxOutput metadata message.
-    ///
-    /// Bytes 0..125 are the core ZIP-244 fields (used for sighash computation).
-    /// Bytes 125..129 are the coin_type extension (network discrimination, not hashed).
+    /// Whether this transaction uses the v6 format (NU6.3 / Ironwood).
+    pub fn is_v6(&self) -> bool {
+        (self.version & 0x7FFF_FFFF) >= 6
+    }
+
+    /// Serialize to the wire format for the TxOutput metadata message:
+    /// 129 bytes for v5 transactions, 170 bytes (with the Ironwood bundle
+    /// section) for v6. The device discriminates the layout by size. All
+    /// bytes except the trailing `coin_type[4]` feed sighash computation.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(129);
+        let mut buf = Vec::with_capacity(if self.is_v6() { 170 } else { 129 });
         buf.extend_from_slice(&self.version.to_le_bytes());
         buf.extend_from_slice(&self.version_group_id.to_le_bytes());
         buf.extend_from_slice(&self.consensus_branch_id.to_le_bytes());
@@ -356,6 +426,11 @@ impl TxMeta {
         buf.push(self.orchard_flags);
         buf.extend_from_slice(&self.value_balance.to_le_bytes());
         buf.extend_from_slice(&self.anchor);
+        if self.is_v6() {
+            buf.push(self.ironwood_flags);
+            buf.extend_from_slice(&self.ironwood_value_balance.to_le_bytes());
+            buf.extend_from_slice(&self.ironwood_anchor);
+        }
         buf.extend_from_slice(&self.transparent_sig_digest);
         buf.extend_from_slice(&self.sapling_digest);
         buf.extend_from_slice(&self.coin_type.to_le_bytes());
@@ -370,11 +445,14 @@ impl TxMeta {
     pub fn from_pczt(pczt: &pczt::Pczt) -> Self {
         let global = pczt.global();
         let orchard = pczt.orchard();
-        let (magnitude, is_negative) = orchard.value_sum();
-        let value_balance = if *is_negative {
-            -(*magnitude as i64)
-        } else {
-            *magnitude as i64
+        let ironwood = pczt.ironwood();
+        let signed_value_sum = |vs: &(u64, bool)| -> i64 {
+            let (magnitude, is_negative) = vs;
+            if *is_negative {
+                -(*magnitude as i64)
+            } else {
+                *magnitude as i64
+            }
         };
         Self {
             version: *global.tx_version(),
@@ -383,8 +461,11 @@ impl TxMeta {
             lock_time: 0,
             expiry_height: *global.expiry_height(),
             orchard_flags: *orchard.flags(),
-            value_balance,
+            value_balance: signed_value_sum(orchard.value_sum()),
             anchor: *orchard.anchor(),
+            ironwood_flags: *ironwood.flags(),
+            ironwood_value_balance: signed_value_sum(ironwood.value_sum()),
+            ironwood_anchor: *ironwood.anchor(),
             // These will be filled in by the workflow from the TxDigests
             transparent_sig_digest: [0u8; 32],
             sapling_digest: [0u8; 32],

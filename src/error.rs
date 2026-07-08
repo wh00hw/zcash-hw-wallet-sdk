@@ -123,3 +123,9 @@ impl From<orchard::pczt::ParseError> for HwSignerError {
         HwSignerError::SignerInitFailed(format!("Orchard PCZT parse error: {:?}", e))
     }
 }
+
+impl From<pczt::roles::low_level_signer::OrchardParseError> for HwSignerError {
+    fn from(e: pczt::roles::low_level_signer::OrchardParseError) -> Self {
+        HwSignerError::SignerInitFailed(format!("Orchard-protocol PCZT parse error: {:?}", e))
+    }
+}

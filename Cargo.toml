@@ -46,9 +46,9 @@ ripemd = "0.1"
 # orchard / pczt dependency tree.
 rand_core = { version = "0.6", features = ["getrandom"] }
 
-# Zcash crates — aligned with librustzcash main
-pczt = { version = "0.5", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
-orchard = "0.12"
+# Zcash crates — aligned with librustzcash main (NU6.3 / Ironwood pre-release stack)
+pczt = { version = "0.7", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
+orchard = "0.15.0-pre.2"
 reddsa = "0.5"
 ff = "0.13"
 # Used in workflow.rs to trial-decrypt out_ciphertext / enc_ciphertext with
@@ -56,9 +56,9 @@ ff = "0.13"
 # on-chip enc_ciphertext recomputation (v5 memo-verifying protocol).
 zcash_note_encryption = "0.4"
 secp256k1 = "0.29"
-zcash_address = "0.10"
-zcash_primitives = "0.26"
-zcash_protocol = "0.7"
+zcash_address = "0.13.0-pre.0"
+zcash_primitives = "0.29.0-pre.0"
+zcash_protocol = "0.10.0-pre.0"
 
 # Serial transport (optional)
 serialport = { version = "4", optional = true }
@@ -86,7 +86,7 @@ blake2b_simd = "1"
 # someone runs `git submodule update --init`.
 #
 # Pinned commit (audit H4 — keep this in sync with the actual submodule HEAD):
-#   librustzcash @ f646a1119d5e0214d02fb1575e662c6b0ec57c8d
+#   librustzcash @ bd1bc3fbe6b9168c9654db2b3a7fdc5e7b1c15f8 (NU6.3 / Ironwood)
 #
 # To verify the submodule is at the documented commit before a release:
 #   git -C librustzcash rev-parse HEAD
@@ -103,8 +103,6 @@ blake2b_simd = "1"
 # Audit: docs/security-audit/04-host-sdk-rust.md H4.
 [patch.crates-io]
 pczt = { path = "librustzcash/pczt" }
-orchard = { package = "orchard", git = "https://github.com/zcash/orchard.git", rev = "6b12c77260aa7fac0d804983fc31b71b584d48e0" }
-sapling-crypto = { git = "https://github.com/zcash/sapling-crypto.git", rev = "e99f38a8f4685c381bb4cca94874092e50e3f7e9" }
 zcash_primitives = { path = "librustzcash/zcash_primitives" }
 zcash_protocol = { path = "librustzcash/components/zcash_protocol" }
 zcash_address = { path = "librustzcash/components/zcash_address" }

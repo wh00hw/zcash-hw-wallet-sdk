@@ -234,7 +234,7 @@ version = "4.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60d4bd9d1db2c6bdf285e223a7fa369d5ce98ec767dec949c6ca62863ce61757"
 dependencies = [
- "core2 0.4.0",
+ "core2",
 ]
 
 [[package]]
@@ -468,21 +468,18 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core2"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "239fa3ae9b63c2dc74bd3fa852d4792b8b305ae64eeede946265b6af62f1fff3"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "core2"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b49ba7ef1ad6107f8824dbe97de947cbaac53c44e7f9756a1fba0d37c1eec505"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "corez"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4df6f98652d30167eaeea34d77b730e07c8caba6df17bd4551842b9b8da01deb"
 
 [[package]]
 name = "cpufeatures"
@@ -689,10 +686,10 @@ dependencies = [
 
 [[package]]
 name = "equihash"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "blake2b_simd",
- "core2 0.3.3",
+ "corez",
 ]
 
 [[package]]
@@ -923,9 +920,9 @@ dependencies = [
 
 [[package]]
 name = "halo2_gadgets"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45824ce0dd12e91ec0c68ebae2a7ed8ae19b70946624c849add59f1d1a62a143"
+checksum = "fb2a697cad929f706b7987fe804ad57d43622cd37463ba7e4d662a926fdcfea3"
 dependencies = [
  "arrayvec",
  "bitvec",
@@ -1466,13 +1463,14 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "orchard"
-version = "0.12.0"
-source = "git+https://github.com/zcash/orchard.git?rev=6b12c77260aa7fac0d804983fc31b71b584d48e0#6b12c77260aa7fac0d804983fc31b71b584d48e0"
+version = "0.15.0-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d77752de9c2865ca4a0d962b201b473d60bbe438d53a964a8707ec4bd401d631"
 dependencies = [
  "aes",
  "bitvec",
  "blake2b_simd",
- "core2 0.3.3",
+ "corez",
  "ff",
  "fpe",
  "getset",
@@ -1560,7 +1558,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "pczt"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "blake2b_simd",
  "bls12_381",
@@ -2011,8 +2009,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "sapling-crypto"
-version = "0.6.2"
-source = "git+https://github.com/zcash/sapling-crypto.git?rev=e99f38a8f4685c381bb4cca94874092e50e3f7e9#e99f38a8f4685c381bb4cca94874092e50e3f7e9"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d70756ede56b5e4dd417979777bd87ddb83dfcbd0815dbf8175a9920537f8a0"
 dependencies = [
  "aes",
  "bellman",
@@ -2020,7 +2019,7 @@ dependencies = [
  "blake2b_simd",
  "blake2s_simd",
  "bls12_381",
- "core2 0.3.3",
+ "corez",
  "document-features",
  "ff",
  "fpe",
@@ -2751,11 +2750,11 @@ dependencies = [
 
 [[package]]
 name = "zcash_address"
-version = "0.10.1"
+version = "0.13.0-pre.0"
 dependencies = [
  "bech32",
  "bs58",
- "core2 0.3.3",
+ "corez",
  "f4jumble",
  "zcash_encoding",
  "zcash_protocol",
@@ -2763,9 +2762,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_encoding"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
- "core2 0.3.3",
+ "corez",
  "hex",
  "nonempty",
 ]
@@ -2785,11 +2784,11 @@ dependencies = [
 
 [[package]]
 name = "zcash_primitives"
-version = "0.26.4"
+version = "0.29.0-pre.0"
 dependencies = [
  "blake2b_simd",
  "block-buffer 0.11.0-rc.3",
- "core2 0.3.3",
+ "corez",
  "crypto-common 0.2.0-rc.1",
  "document-features",
  "equihash",
@@ -2813,9 +2812,9 @@ dependencies = [
 
 [[package]]
 name = "zcash_protocol"
-version = "0.7.2"
+version = "0.10.0-pre.0"
 dependencies = [
- "core2 0.3.3",
+ "corez",
  "document-features",
  "hex",
  "memuse",
@@ -2850,11 +2849,11 @@ dependencies = [
 
 [[package]]
 name = "zcash_transparent"
-version = "0.6.3"
+version = "0.9.0-pre.0"
 dependencies = [
  "bip32",
  "bs58",
- "core2 0.3.3",
+ "corez",
  "document-features",
  "getset",
  "hex",

@@ -73,11 +73,13 @@ Using only upstream APIs, the SDK implements this workflow:
 5. Initialize Signer              Signer::new() — computes sighash
 6. Read sighash                   signer.shielded_sighash()
 7. Read action data                low_level_signer::sign_orchard_with()
+                                   + sign_ironwood_with() (NU6.3 pool)
 8. Send to device for ZIP-244      HWP TX_OUTPUT messages
    sighash verification
 9. Sign on device                  HWP SIGN_REQ/SIGN_RSP
 10. Verify signature               reddsa::VerificationKey::verify()
 11. Apply signature to PCZT        signer.apply_orchard_signature(i, sig)
+                                   / apply_ironwood_signature(i, sig)
 12. Finalize                       signer.finish() → signed Pczt
 ```
 
@@ -85,16 +87,19 @@ No shadow deserialization, no `pub(crate)` workarounds, no patched crates.
 
 ## Current Situation
 
-These APIs are present in librustzcash `main` but the last published `pczt` on crates.io is **v0.5.1** (pre-dating the external signing support).
-
-The `zcash-hw-wallet-sdk` currently uses a `[patch.crates-io]` section pointing to a librustzcash git submodule to access these APIs. Once a new `pczt` version is published, the patch and submodule can be dropped.
+The external-signing APIs shipped on crates.io starting with `pczt` 0.6.0
+(current: **0.7.0**, 2026-06-03). The SDK still uses a `[patch.crates-io]`
+section pointing to a librustzcash git submodule (`bd1bc3fbe6`, post-0.7.0
+`main`), but for a new reason: the **Ironwood (NU6.3) PCZT v2 support** —
+the `ironwood` bundle field, `sign_ironwood_with`, `apply_ironwood_signature`,
+`create_ironwood_proof`, and the v6 sighash plumbing — was merged to `main`
+after the 0.7.0 release and is not yet published.
 
 ## Recommendation
 
-Publishing a new `pczt` release (0.5.2 or 0.6.0) to crates.io would:
-
-1. Enable hardware wallet SDKs to depend on a stable crates.io release
-2. Remove the need for git dependencies / submodules / patches
-3. Formalize the external signing API as part of the public contract
-
-The external signing APIs (`shielded_sighash`, `apply_orchard_signature`, `apply_sapling_signature`, `append_transparent_signature`) are clean, safe, and follow the existing patterns in the Signer role. They require no changes — only a release.
+Publishing the NU6.3-capable `pczt` (and the matching `zcash_primitives` /
+`zcash_protocol` finals, currently `0.29.0-pre.0` / `0.10.0-pre.0`) to
+crates.io would let hardware-wallet SDKs drop the git submodule and patch
+table entirely. The Ironwood signing APIs follow the exact patterns of their
+Orchard counterparts — they require no changes, only a release, which is
+expected as part of the NU6.3 activation stack (mainnet ~2026-07-21).
