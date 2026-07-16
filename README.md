@@ -339,7 +339,7 @@ Three types of TxOutput messages are used, discriminated by `output_index`:
 | 0x12 | `FeeOverflow` | Transparent value sums or `value_balance` combine to an out-of-range fee |
 | 0x13 | `FeeNegative` | `t_in + value_balance < t_out` — companion built an unbalanced bundle |
 
-> The wire protocol (canonical definition in `libzcash-ironwood-c`'s `hwp.h`) defines codes `0x00` (`Unknown`) through `0x13`. The SDK's typed `ErrorCode` enum currently parses `0x00`–`0x0E`; codes `0x0F`–`0x13` are device-originated and surface host-side as `Unknown` together with the device's error message string.
+> The wire protocol (canonical definition in `libzcash-ironwood-c`'s `hwp.h`) defines codes `0x00` (`Unknown`) through `0x13`; the SDK's typed `ErrorCode` enum mirrors the full range. `UserCancelled`, `SighashMismatch`, `TransparentDigestMismatch`, `SaplingNotEmpty`, `NoteCommitmentMismatch`, and `RecipientMismatch` map to dedicated `HwSignerError` variants; the remaining codes surface as `HwSignerError::DeviceError` with the code name and the device's message string.
 
 ### `verify` -- Signature Verification
 
@@ -404,9 +404,10 @@ ZIP-244 action data + note plaintext sent to the device for on-device sighash + 
 | `value` | `u64` | **Output-note value** in zatoshis. Verified via cmx + enc_ciphertext; displayed to the user. |
 | `rseed` | `[u8; 32]` | **Output-note random seed**. Required input to the device's `psi` / `rcm` derivation per Orchard `§ 4.7.3` **and** to the ZIP-212 esk derivation used for memo verification. |
 | `memo` | `Option<[u8; 512]>` | **Output-note memo plaintext** (ZIP-302). Recovered on the host side by trial-decrypting `out_ciphertext` with the device's external OVK (`try_output_recovery_with_ovk`). Sent as the trailing 512 bytes of the memo-verifying wire format so the device can recompute `enc_ciphertext` and reject any host that embeds a different memo on chain than what the user is shown. `None` for `OVK::None` outputs — falls back to the cmx-only wire format for that action. |
-| `esk` | `Option<[u8; 32]>` | Legacy field, always `None` in the current workflow — `esk` is derived on-device from `rseed + rho` per ZIP-212 and never transmitted. Only the legacy `serialize_v5()` format would carry it. |
 
-Wire formats: for v6 (NU6.3/Ironwood) transactions `ActionData::serialize_v6()` emits the pool-tagged **1416-byte** memo-verifying payload, or the pool-tagged **904-byte** cmx-only form when `memo` is `None`. For legacy v5 transactions the SDK emits the **903-byte** v4 cmx-only payload via `ActionData::serialize()` (the legacy `serialize_v5()` — 1447 bytes, memo + esk on the wire — requires an `esk` the workflow never populates, so it is effectively unused). `DeviceSigner` selects the format from `TxMeta::is_v6()`.
+`esk` is never part of the struct or the wire — the device derives it on-chip from `rseed + rho` per ZIP-212.
+
+Wire formats: for v6 (NU6.3/Ironwood) transactions `ActionData::serialize_v6()` emits the pool-tagged **1416-byte** memo-verifying payload, or the pool-tagged **904-byte** cmx-only form when `memo` is `None`. For legacy v5 transactions the SDK emits the **903-byte** v4 cmx-only payload via `ActionData::serialize()`. `DeviceSigner` selects the format from `TxMeta::is_v6()`.
 
 The trailing `(recipient, value, rseed, memo)` block is what closes both the recipient-substitution attack AND the memo-substitution attack a hostile companion would otherwise mount inside the Orchard bundle. Without `recipient/value/rseed` the device cannot verify cmx; without `memo` it cannot verify enc_ciphertext. With both, it recomputes Sinsemilla-NoteCommit + ChaCha20-Poly1305 on-device and rejects any swap.
 
