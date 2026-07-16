@@ -3,13 +3,13 @@ project(virtual-device C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# Path to libzcash-orchard-c source tree
-set(LIBZCASH_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../libzcash-orchard-c"
-    CACHE PATH "Path to libzcash-orchard-c source directory")
+# Path to libzcash-ironwood-c source tree
+set(LIBZCASH_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../libzcash-ironwood-c"
+    CACHE PATH "Path to libzcash-ironwood-c source directory")
 
-# Build libzcash-orchard-c in-tree without tests.
+# Build libzcash-ironwood-c in-tree without tests.
 #
-# audit C-2: starting with libzcash-orchard-c >= 5da4a77, the library
+# audit C-2: starting with libzcash-ironwood-c >= 5da4a77, the library
 # defaults to USE_PLATFORM_RNG=1 — every integration MUST link a
 # `random_buffer()` from a CSPRNG. The virtual device is a test fixture
 # (not a real signer), so we opt into the LCG fallback to avoid pulling

@@ -137,13 +137,33 @@ fn test_encode_sign_req_recipient_too_long() {
         alpha: [0x22; 32],
         amount: 100_000,
         fee: 10_000,
-        recipient: "x".repeat(128), // exceeds 127-byte limit
+        recipient: "x".repeat(256), // exceeds the 255-byte wire ceiling
         action_index: 0,
         total_actions: 1,
     };
 
     let err = protocol::hwp::encode_sign_req(&req).unwrap_err();
-    assert!(matches!(err, HwSignerError::RecipientTooLong { len: 128, max: 127 }));
+    assert!(matches!(err, HwSignerError::RecipientTooLong { len: 256, max: 255 }));
+}
+
+#[test]
+fn test_encode_sign_req_long_multi_receiver_ua() {
+    // A multi-receiver testnet UA (~217 chars) must encode successfully:
+    // this is the exact case the old 127-byte cap wrongly rejected.
+    let ua = "utest1".to_string() + &"q".repeat(211);
+    assert_eq!(ua.len(), 217);
+    let req = SignRequest {
+        sighash: [0x11; 32],
+        alpha: [0x22; 32],
+        amount: 50_000,
+        fee: 20_000,
+        recipient: ua.clone(),
+        action_index: 0,
+        total_actions: 1,
+    };
+    let payload = protocol::hwp::encode_sign_req(&req).expect("217-char UA must encode");
+    assert_eq!(payload[80], 217); // recipient_len byte
+    assert_eq!(&payload[81..81 + 217], ua.as_bytes());
 }
 
 #[test]

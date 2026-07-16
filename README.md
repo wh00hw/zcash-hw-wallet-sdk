@@ -578,7 +578,7 @@ The SDK does not need any change for this either; the fee math + confirmation fl
 10. On subsequent `SignReq`, device verifies the sighash and `state == VERIFIED`
 11. RedPallas signature produced
 
-**Device-side implementation** is provided by [libzcash-orchard-c](https://github.com/wh00hw/libzcash-orchard-c) — `zip244.h`/`zip244.c` for the digest tree, `orchard.c` for `orchard_compute_cmx` + `orchard_encode_ua_raw`, `orchard_signer.c` for the state machine.
+**Device-side implementation** is provided by [libzcash-orchard-c](https://github.com/wh00hw/libzcash-ironwood-c) — `zip244.h`/`zip244.c` for the digest tree, `orchard.c` for `orchard_compute_cmx` + `orchard_encode_ua_raw`, `orchard_signer.c` for the state machine.
 
 **Note:** The SDK uses `Pczt::into_effects()` and `TxIdDigester` from `zcash_primitives` to extract the transparent sub-digest. This ensures the value is identical to what the official `pczt::roles::signer::Signer` uses internally for sighash computation. The `TxMeta` is built from the `TransactionData` directly (not from PCZT Global fields) to guarantee field-level consistency (e.g., `lock_time` determined by `determine_lock_time()`). The sapling digest field in `TxMeta` is always the empty-bundle constant by SDK invariant.
 
@@ -664,7 +664,7 @@ The SDK is **hardware-agnostic** -- implement the `HardwareSigner` trait or spea
 
 ### Device-side: libzcash-orchard-c
 
-The companion library [**libzcash-orchard-c**](https://github.com/wh00hw/libzcash-orchard-c) provides a pure C11 implementation of the Zcash Orchard primitives and the HWP protocol, designed specifically for embedded hardware wallets where Rust is not available.
+The companion library [**libzcash-orchard-c**](https://github.com/wh00hw/libzcash-ironwood-c) provides a pure C11 implementation of the Zcash Orchard primitives and the HWP protocol, designed specifically for embedded hardware wallets where Rust is not available.
 
 It includes:
 

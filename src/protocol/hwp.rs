@@ -21,7 +21,12 @@ pub const HWP_CRC_SIZE: usize = 2;
 /// `enc_ciphertext` on-chip and reject memo substitution. Must match the
 /// device-side `HWP_MAX_PAYLOAD` in `libzcash-orchard-c/include/hwp.h`.
 pub const HWP_MAX_PAYLOAD: usize = 2048;
-pub const HWP_MAX_RECIPIENT: usize = 127;
+/// Maximum recipient-string length. `recipient_len` is a single wire byte, so
+/// the hard ceiling is 255. A multi-receiver Unified Address (Orchard +
+/// Sapling + transparent) runs past 127 chars — a testnet UA with all three is
+/// ~217 — so a 127-byte cap rejected valid destinations. Keep in sync with
+/// `HWP_MAX_RECIPIENT` in the device firmware (`libzcash-orchard-c/include/hwp.h`).
+pub const HWP_MAX_RECIPIENT: usize = 255;
 /// Maximum number of keepalive (PING) messages tolerated before aborting.
 /// Prevents infinite loops if a device keeps sending PINGs without progressing.
 pub const HWP_MAX_KEEPALIVE: usize = 1000;
