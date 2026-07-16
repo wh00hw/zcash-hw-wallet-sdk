@@ -462,10 +462,14 @@ impl TxMeta {
             expiry_height: *global.expiry_height(),
             orchard_flags: *orchard.flags(),
             value_balance: signed_value_sum(orchard.value_sum()),
-            anchor: *orchard.anchor(),
+            // librustzcash 292e7584: PCZT bundles carry deferred (Option)
+            // anchors across roles. Absent here means the anchor is not yet
+            // populated — fall back to the empty value (the workflow
+            // recomputes the authoritative sighash from the tx effects).
+            anchor: (*orchard.anchor()).unwrap_or([0u8; 32]),
             ironwood_flags: *ironwood.flags(),
             ironwood_value_balance: signed_value_sum(ironwood.value_sum()),
-            ironwood_anchor: *ironwood.anchor(),
+            ironwood_anchor: (*ironwood.anchor()).unwrap_or([0u8; 32]),
             // These will be filled in by the workflow from the TxDigests
             transparent_sig_digest: [0u8; 32],
             sapling_digest: [0u8; 32],

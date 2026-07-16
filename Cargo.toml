@@ -48,7 +48,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Zcash crates — aligned with librustzcash main (NU6.3 / Ironwood pre-release stack)
 pczt = { version = "0.7", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
-orchard = "0.15.0-pre.2"
+orchard = "0.15.0"
 reddsa = "0.5"
 ff = "0.13"
 # Used in workflow.rs to trial-decrypt out_ciphertext / enc_ciphertext with
@@ -56,9 +56,9 @@ ff = "0.13"
 # on-chip enc_ciphertext recomputation (v5 memo-verifying protocol).
 zcash_note_encryption = "0.4"
 secp256k1 = "0.29"
-zcash_address = "0.13.0-pre.0"
-zcash_primitives = "0.29.0-pre.0"
-zcash_protocol = "0.10.0-pre.0"
+zcash_address = "0.13.0"
+zcash_primitives = "0.29.0"
+zcash_protocol = "0.10.0"
 
 # Serial transport (optional)
 serialport = { version = "4", optional = true }
@@ -76,7 +76,6 @@ ur = { version = "0.4", optional = true }
 tokio = { version = "1", features = ["full"] }
 blake2b_simd = "1"
 
-# ============================================================================
 # [patch.crates-io] — vendored librustzcash submodule
 # ============================================================================
 # The four `path = "librustzcash/..."` entries below redirect crates.io
@@ -106,3 +105,8 @@ pczt = { path = "librustzcash/pczt" }
 zcash_primitives = { path = "librustzcash/zcash_primitives" }
 zcash_protocol = { path = "librustzcash/components/zcash_protocol" }
 zcash_address = { path = "librustzcash/components/zcash_address" }
+=======
+# NOTE: no [patch.crates-io] here — when built as a path dependency of
+# zipher-app, the workspace root patches all zcash crates to librustzcash
+# rev 292e7584 (NU6.3 / Ironwood). Building this SDK standalone requires
+# adding that patch table.

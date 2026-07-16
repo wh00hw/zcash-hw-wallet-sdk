@@ -179,10 +179,14 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                 expiry_height: u32::from(tx_data.expiry_height()),
                 orchard_flags: *orchard_bundle.flags(),
                 value_balance: signed_value_sum(orchard_bundle.value_sum()),
-                anchor: *orchard_bundle.anchor(),
+                // librustzcash 292e7584: PCZT anchors are deferred (Option).
+                // At signing time the bundle being signed has a populated
+                // anchor; an absent one for a non-empty bundle is a malformed
+                // PCZT. Empty bundles legitimately carry no anchor.
+                anchor: (*orchard_bundle.anchor()).unwrap_or([0u8; 32]),
                 ironwood_flags: *ironwood_bundle.flags(),
                 ironwood_value_balance: signed_value_sum(ironwood_bundle.value_sum()),
-                ironwood_anchor: *ironwood_bundle.anchor(),
+                ironwood_anchor: (*ironwood_bundle.anchor()).unwrap_or([0u8; 32]),
                 transparent_sig_digest,
                 sapling_digest,
                 coin_type: self.signer.coin_type(),
