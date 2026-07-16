@@ -47,7 +47,7 @@ ripemd = "0.1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Zcash crates — aligned with librustzcash main (NU6.3 / Ironwood pre-release stack)
-pczt = { version = "0.7", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
+pczt = { version = "0.8.0-rc.1", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
 orchard = "0.15.0"
 reddsa = "0.5"
 ff = "0.13"
