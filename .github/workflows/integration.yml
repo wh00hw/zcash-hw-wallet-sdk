@@ -20,7 +20,7 @@ jobs:
       - name: Build virtual device
         run: |
           cd integration-tests/virtual-device
-          cmake -B build -DLIBZCASH_SOURCE_DIR=${{ github.workspace }}/libzcash-orchard-c
+          cmake -B build -DLIBZCASH_SOURCE_DIR=${{ github.workspace }}/libzcash-ironwood-c
           cmake --build build -j$(nproc)
 
       - name: Start virtual device
