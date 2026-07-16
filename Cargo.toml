@@ -53,7 +53,7 @@ reddsa = "0.5"
 ff = "0.13"
 # Used in workflow.rs to trial-decrypt out_ciphertext / enc_ciphertext with
 # the device's OVK so we can forward the memo plaintext to the device for
-# on-chip enc_ciphertext recomputation (v5 memo-verifying protocol).
+# on-chip enc_ciphertext recomputation (memo-verifying protocol).
 zcash_note_encryption = "0.4"
 secp256k1 = "0.29"
 zcash_address = "0.13.0"
@@ -76,7 +76,7 @@ ur = { version = "0.4", optional = true }
 tokio = { version = "1", features = ["full"] }
 blake2b_simd = "1"
 
-# NOTE: no [patch.crates-io] here — when built as a path dependency of
-# zipher-app, the workspace root patches all zcash crates to librustzcash
-# rev 292e7584 (NU6.3 / Ironwood). Building this SDK standalone requires
-# adding that patch table.
+# NOTE: no [patch.crates-io] here — the standalone build resolves the
+# NU6.3-capable stack straight from crates.io (pczt 0.8.0-rc.1, orchard
+# 0.15.0). When built as a path dependency of zipher-app, the workspace
+# root may still patch the zcash crates to a pinned librustzcash revision.

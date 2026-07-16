@@ -429,9 +429,6 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                     value,
                     rseed,
                     memo,
-                    // esk is derived on-device from (rseed, rho); not
-                    // transmitted over the wire.
-                    esk: None,
                 });
             }
             Ok(())

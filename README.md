@@ -61,13 +61,14 @@ zcash-hw-wallet-sdk = "0.1"
 ### Sign a transaction with a serial device
 
 ```rust
-use zcash_hw_wallet_sdk::{DeviceSigner, PcztHardwareSigning};
+use zcash_hw_wallet_sdk::PcztHardwareSigning;
 
-// Connect to a hardware signing device over USB serial
-let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0")?;
+// Connect to a hardware signing device over USB serial.
+// The coin_type selects the network: 133 = mainnet, 1 = testnet.
+let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0", 1)?;
 
 // Sign a PCZT (from zcash_client_backend::create_pczt_from_proposal)
-let mut workflow = PcztHardwareSigning::new(signer, Network::TestNetwork);
+let mut workflow = PcztHardwareSigning::new(signer);
 let result = workflow.sign(pczt_bytes)?;
 
 // result.signed_pczt -> extract_and_store_transaction_from_pczt()
@@ -81,38 +82,19 @@ zcash-hw-wallet-sdk = { version = "0.1", features = ["ledger"] }
 ```
 
 ```rust
-use zcash_hw_wallet_sdk::{DeviceSigner, PcztHardwareSigning};
+use zcash_hw_wallet_sdk::PcztHardwareSigning;
 
 // Auto-detect the first connected Ledger (Zcash Orchard app must be open)
-let signer = zcash_hw_wallet_sdk::signer::connect_ledger()?;
+let signer = zcash_hw_wallet_sdk::signer::connect_ledger(133)?;
 
-let mut workflow = PcztHardwareSigning::new(signer, Network::MainNetwork);
+let mut workflow = PcztHardwareSigning::new(signer);
 let result = workflow.sign(pczt_bytes)?;
-```
-
-### Sign a transaction with Ledger natively (Hanh's APDU App builder)
-
-Instead of the blind PCZT flow, this SDK offers parallel bindings for Hanh's native "builder" app on Ledger:
-
-```rust
-let client = zcash_hw_wallet_sdk::signer::connect_ledger_apdu()?;
-
-// 1. Initialize TX state machine
-client.init_tx()?;
-
-// 2. Provide plaintext action data (device re-computes commitments internally)
-client.add_o_action(&nf, &address, amount, &epk, &enc, true)?;
-
-// 3. Confirm and sign
-client.confirm_fee(true)?;
-let signature = client.sign_orchard(Some(&alpha))?;
-client.end_tx()?;
 ```
 
 For development with the Speculos emulator:
 
 ```rust
-let signer = zcash_hw_wallet_sdk::signer::connect_speculos("127.0.0.1:9999")?;
+let signer = zcash_hw_wallet_sdk::signer::connect_speculos("127.0.0.1:9999", 1)?;
 ```
 
 ### Implement support for your own hardware
@@ -120,7 +102,7 @@ let signer = zcash_hw_wallet_sdk::signer::connect_speculos("127.0.0.1:9999")?;
 To add Zcash Orchard support to **any** hardware wallet:
 
 1. `cargo add zcash-hw-wallet-sdk`
-2. Implement the `HardwareSigner` trait (4 methods, 2 have defaults)
+2. Implement the `HardwareSigner` trait (3 required methods; 3 more have defaults)
 3. Done
 
 ```rust
@@ -129,6 +111,10 @@ use zcash_hw_wallet_sdk::*;
 struct MyDevice { /* your transport handle */ }
 
 impl HardwareSigner for MyDevice {
+    fn coin_type(&self) -> u32 {
+        133 // mainnet (1 = testnet) — drives ZIP-32 derivation + network checks
+    }
+
     fn export_fvk(&mut self) -> Result<ExportedFvk> {
         // Read FVK components (ak, nk, rivk) from your device
         todo!()
@@ -139,10 +125,10 @@ impl HardwareSigner for MyDevice {
         todo!()
     }
 
-    fn confirm_transaction(&mut self, details: &TxDetails) -> Result<bool> {
-        // Optional: display transaction on device screen
-        Ok(true) // default: auto-confirm (headless devices)
-    }
+    // Provided defaults you can override:
+    //   confirm_transaction(details)          -> Ok(true)  (auto-confirm, headless)
+    //   verify_transaction(...)               -> Ok(())    (no on-device verification)
+    //   sign_transparent_input(req, input)    -> Err(UnsupportedPool)
 }
 
 // Use it
@@ -168,8 +154,9 @@ The SDK orchestrates the full PCZT pipeline automatically:
                         signatures (alpha present, sig absent)
          |
 5. On-device verify    Send each action's ZIP-244 data + full note
-                        plaintext (incl. memo) to the device via v5
-                        TxOutput messages (1415 bytes per action).
+                        plaintext (incl. memo) to the device via
+                        TxOutput messages (pool-tagged v6 payload,
+                        1416 bytes per action).
                         Device independently recomputes sighash, cmx,
                         enc_ciphertext, epk, transparent digest, fee,
                         and drives per-output + fee user confirmation
@@ -189,7 +176,8 @@ The SDK orchestrates the full PCZT pipeline automatically:
                         - Check rk matches PCZT action
                         - Cryptographically verify RedPallas sig
          |
-9. Inject Signatures    Call set_external_spend_auth_sig() per action
+9. Inject Signatures    Call apply_orchard_signature() /
+                        apply_ironwood_signature() per action (by pool)
          |
 10. Return Signed PCZT  Serialize and return for tx extraction
 ```
@@ -204,10 +192,12 @@ The core trait any hardware device must implement:
 
 | Method | Purpose | Called |
 |---|---|---|
-| `export_fvk(coin_type)` | Export Orchard full viewing key (ak, nk, rivk) for the given network (133=mainnet, 1=testnet) | Once, during pairing |
-| `sign_action(request)` | Sign a single Orchard action given sighash + alpha | Once per action |
+| `coin_type()` | SLIP-44 coin type the signer operates on (133=mainnet, 1=testnet); drives ZIP-32 derivation and network validation | Required; whenever the network matters |
+| `export_fvk()` | Export Orchard full viewing key (ak, nk, rivk) for the signer's `coin_type` | Once, during pairing |
+| `sign_action(request)` | Sign a single Orchard/Ironwood action given sighash + alpha | Once per action |
 | `confirm_transaction(details)` | Display tx on device for user confirmation | Once per tx (optional, default: auto-confirm) |
-| `verify_transaction(meta, actions, sighash, t_inputs, t_outputs)` | Send tx metadata + Orchard actions + transparent flow for on-device sighash + cmx + enc_ciphertext + fee verification | Once per tx (optional, default: no-op) |
+| `verify_transaction(meta, actions, sighash, t_inputs, t_outputs)` | Send tx metadata + shielded actions + transparent flow for on-device sighash + cmx + enc_ciphertext + fee verification | Once per tx (optional, default: no-op) |
+| `sign_transparent_input(request, input_data)` | Sign a transparent input on-device (ECDSA secp256k1) | Once per transparent input (optional, default: `Err(UnsupportedPool)`) |
 
 ### `workflow` -- `PcztHardwareSigning<S>`
 
@@ -215,21 +205,24 @@ The orchestrator that handles the full signing pipeline. Accepts any `S: Hardwar
 
 | Method | Description |
 |---|---|
-| `new(signer, network)` | Create workflow with explicit network (mainnet/testnet) |
+| `new(signer)` | Create workflow — the network is derived from `signer.coin_type()` |
 | `sign(pczt_bytes)` | Sign a PCZT, return `SigningResult` |
 | `sign_with_details(pczt_bytes, details)` | Sign with device-side user confirmation |
+| `signer()` / `signer_mut()` / `into_signer()` | Access or reclaim the wrapped signer |
 
 ### `signer` -- `DeviceSigner<T>`
 
 A ready-to-use `HardwareSigner` implementation that communicates with any HWP-compatible device over any `Transport`.
 
-| Constructor | Feature | Description |
+| Constructor / method | Feature | Description |
 |---|---|---|
-| `DeviceSigner::new(transport)` | — | Connect and handshake (if required by transport) |
-| `DeviceSigner::new_no_handshake(transport)` | — | Skip handshake (already done) |
-| `connect_serial(path)` | `serial` | Convenience: open USB CDC serial + handshake |
-| `connect_ledger()` | `ledger` | Convenience: find first Ledger USB HID device |
-| `connect_speculos(addr)` | `ledger` | Convenience: connect to Speculos emulator via TCP |
+| `DeviceSigner::new(transport, coin_type)` | — | Connect and handshake (if required by transport) |
+| `DeviceSigner::new_no_handshake(transport, coin_type)` | — | Skip handshake (already done) |
+| `DeviceSigner::new_with_pinned_pubkey(transport, coin_type, pubkey)` | — | Connect and verify the device identity against a pinned pubkey (attestation) |
+| `pair()` / `attest(pinned_pubkey)` | — | First-pairing: fetch the device identity pubkey to store/pin — / — re-run a challenge-response attestation mid-session |
+| `connect_serial(path, coin_type)` | `serial` | Convenience: open USB CDC serial + handshake |
+| `connect_ledger(coin_type)` | `ledger` | Convenience: find first Ledger USB HID device |
+| `connect_speculos(addr, coin_type)` | `ledger` | Convenience: connect to Speculos emulator via TCP |
 
 ### `transport` -- Transport Layer
 
@@ -258,9 +251,9 @@ pub trait Transport {
 
 `requires_handshake()` controls whether the initial PING/PONG exchange is performed. Serial devices send a PING on boot and expect PONG before accepting commands. Ledger devices are passive (APDU request-response) and return `false`.
 
-### `protocol` -- Hardware Wallet Protocol (HWP) v5
+### `protocol` -- Hardware Wallet Protocol (HWP) v6
 
-Binary framed protocol designed for constrained devices. v5 is the current wire revision; earlier revisions (v1..v4) layered in ZIP-244 sighash verification, transparent digest verification + ECDSA signing, and Orchard cmx + per-action user confirmation. v5 closes the remaining gap by adding on-device `enc_ciphertext` recomputation (memo binding) and explicit user confirmation of the miner fee.
+Binary framed protocol designed for constrained devices. v6 is the current feature tier (NU6.3 / Ironwood: pool-tagged action payloads, five-leaf sighash tree); earlier tiers layered in ZIP-244 sighash verification (v2), transparent digest verification + ECDSA signing (v3), Orchard cmx + per-action user confirmation + device attestation (v4), and on-device `enc_ciphertext` recomputation (memo binding) + explicit miner-fee confirmation (v5).
 
 **Frame format:**
 
@@ -269,9 +262,9 @@ Binary framed protocol designed for constrained devices. v5 is the current wire 
 ```
 
 - Magic: `0xFB`
-- Version: `0x02` (frame header version; the protocol-level "v5" describes the payload semantics, not the byte at offset 1)
+- Version: `0x02` (frame header version; the protocol-level "v3..v6" are feature tiers describing the payload semantics, not the byte at offset 1)
 - CRC: CRC-16/CCITT (poly 0x1021, init 0xFFFF)
-- Max payload: **2048 bytes** (raised in v5 to fit the memo-verifying action payload — 1415 B = action + recipient + value + rseed + memo)
+- Max payload: **2048 bytes** (raised in v5 to fit the memo-verifying action payload — up to 1416 B under v6 = pool tag + action + recipient + value + rseed + memo)
 
 **Message types:**
 
@@ -291,6 +284,10 @@ Binary framed protocol designed for constrained devices. v5 is the current wire 
 | `TxTransparentOutput` | 0x0C | Host -> Device | Transparent output for on-device digest verification |
 | `TransparentSignReq` | 0x0D | Host -> Device | Sign transparent input (ECDSA secp256k1) |
 | `TransparentSignRsp` | 0x0E | Device -> Host | DER signature + sighash_type + compressed pubkey |
+| `IdentityReq` | 0x0F | Host -> Device | Request device identity pubkey (first pairing) |
+| `IdentityRsp` | 0x10 | Device -> Host | Identity pubkey: `device_pubkey[32]` |
+| `AttestReq` | 0x11 | Host -> Device | Attestation challenge: `challenge[32]` |
+| `AttestRsp` | 0x12 | Device -> Host | Attestation: `sig[64] \|\| device_pubkey[32]` (RedPallas, domain-separated) |
 
 **FVK_REQ payload:**
 
@@ -314,8 +311,8 @@ output_index[2 LE] || total_outputs[2 LE] || action_data[N]
 
 Three types of TxOutput messages are used, discriminated by `output_index`:
 
-- `output_index = 0xFFFF` — **Transaction metadata** (129 bytes): `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE signed] || anchor[32] || transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`
-- `output_index = 0..N-1` — **Action + full note plaintext**. The SDK emits the **default 1415-byte v5 payload**: `cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] || memo[512]`. The trailing 595 bytes (recipient + value + rseed + memo) let the device recompute both `cmx` (Sinsemilla) AND `enc_ciphertext` (ChaCha20-Poly1305 with `K_enc = BLAKE2b(epk‖[esk]·pk_d)`, esk derived on-chip from rseed+rho per ZIP-212). Closes both recipient-substitution and memo-substitution attacks. A short 903-byte cmx-only payload is also accepted by the device as a backward-compatible fallback when memo recovery is unavailable on the host side (`OVK::None` outputs); the wallet's normal flow does not use this fallback.
+- `output_index = 0xFFFF` — **Transaction metadata**: `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE signed] || anchor[32] || transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]` (129 bytes, v5). The v6 (NU6.3/Ironwood) layout is 170 bytes — it inserts `ironwood_flags[1] || ironwood_value_balance[8 LE] || ironwood_anchor[32]` after the Orchard anchor; the device discriminates the tier by payload size.
+- `output_index = 0..N-1` — **Action + full note plaintext**. For v6 transactions (the only kind produced post-NU6.3) the SDK emits the **pool-tagged 1416-byte payload**: `pool_tag[1] || cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] || memo[512]`. The trailing 595 bytes (recipient + value + rseed + memo) let the device recompute both `cmx` (Sinsemilla) AND `enc_ciphertext` (ChaCha20-Poly1305 with `K_enc = BLAKE2b(epk‖[esk]·pk_d)`, esk derived on-chip from rseed+rho per ZIP-212). Closes both recipient-substitution and memo-substitution attacks. When the memo is not recoverable on the host side (`OVK::None` outputs) the pool-tagged **904-byte** cmx-only form is sent instead; the wallet's normal flow (`OvkPolicy::Sender`) does not use this fallback. For legacy v5 sessions the SDK sends the untagged 903-byte cmx-only payload (memo binding is exercised only under v6).
 - `output_index = N` (sentinel): Expected 32-byte ZIP-244 sighash for device comparison. Triggers the per-output review loop on-device and then the fee-confirmation step (`get_fee` → user OK → `confirm_fee`) before final `verify()`.
 
 **Error codes:**
@@ -342,6 +339,8 @@ Three types of TxOutput messages are used, discriminated by `output_index`:
 | 0x12 | `FeeOverflow` | Transparent value sums or `value_balance` combine to an out-of-range fee |
 | 0x13 | `FeeNegative` | `t_in + value_balance < t_out` — companion built an unbalanced bundle |
 
+> The wire protocol (canonical definition in `libzcash-ironwood-c`'s `hwp.h`) defines codes `0x00` (`Unknown`) through `0x13`. The SDK's typed `ErrorCode` enum currently parses `0x00`–`0x0E`; codes `0x0F`–`0x13` are device-originated and surface host-side as `Unknown` together with the device's error message string.
+
 ### `verify` -- Signature Verification
 
 After receiving a signature from the device, the SDK verifies:
@@ -355,9 +354,10 @@ This prevents both key confusion attacks and invalid signatures.
 
 Typed error enum covering all failure modes:
 
-- **PCZT workflow**: `ProofFailed`, `SignerInitFailed`, `NoActionsToSign`, `ExtractionFailed`
-- **Signatures**: `RkMismatch`, `SignatureVerificationFailed`, `InvalidVerificationKey`
-- **Device**: `DeviceError`, `UserCancelled`
+- **PCZT workflow**: `ProofFailed`, `SignerInitFailed`, `NoActionsToSign`, `ExtractionFailed`, `SaplingNotSupported`, `UnsupportedPool`
+- **Signatures**: `RkMismatch`, `SignatureVerificationFailed`, `InvalidVerificationKey`, `TransparentSignatureVerificationFailed`
+- **On-device verification**: `NoteCommitmentMismatch`, `RecipientMismatch`, `TransparentSighashMismatch`, `InvalidTransparentInputIndex`, `NetworkMismatch`
+- **Device**: `DeviceError`, `UserCancelled`, `AttestationFailed`
 - **Transport**: `TransportError`, `ConnectionFailed`, `Timeout`
 - **Protocol**: `ProtocolError`, `CrcMismatch`, `UnsupportedVersion`, `UnknownMessageType`, `PayloadTooLarge`, `RecipientTooLong`, `MaxKeepaliveExceeded`, `SequenceMismatch`
 
@@ -392,6 +392,7 @@ ZIP-244 action data + note plaintext sent to the device for on-device sighash + 
 
 | Field | Type | Description |
 |---|---|---|
+| `pool` | `ShieldedPoolKind` | Shielded pool of the action (`Orchard = 0x00`, `Ironwood = 0x01`) — selects the digest tree and note-plaintext version on the device; emitted as the leading pool tag of the v6 wire format |
 | `cv_net` | `[u8; 32]` | Value commitment |
 | `nullifier` | `[u8; 32]` | Nullifier (used as `rho` for the output note's NoteCommit per Orchard's split-action design, AND as input to the on-chip esk derivation for memo verification) |
 | `rk` | `[u8; 32]` | Randomized verification key |
@@ -402,10 +403,10 @@ ZIP-244 action data + note plaintext sent to the device for on-device sighash + 
 | `recipient` | `[u8; 43]` | **Output-note recipient** — raw 43-byte Orchard payment-address encoding (`d[11] || pk_d[32]`). The device recomputes `cmx` + `enc_ciphertext` from this and rejects mismatches; the UI then encodes it as a Bech32m UA via `orchard_encode_ua_raw` and shows it to the user for confirmation. |
 | `value` | `u64` | **Output-note value** in zatoshis. Verified via cmx + enc_ciphertext; displayed to the user. |
 | `rseed` | `[u8; 32]` | **Output-note random seed**. Required input to the device's `psi` / `rcm` derivation per Orchard `§ 4.7.3` **and** to the ZIP-212 esk derivation used for memo verification. |
-| `memo` | `Option<[u8; 512]>` | **Output-note memo plaintext** (ZIP-302). Recovered on the host side by trial-decrypting `out_ciphertext` with the device's external OVK (`try_output_recovery_with_ovk`). Sent in the v5 wire format so the device can recompute `enc_ciphertext` and reject any host that embeds a different memo on chain than what the user is shown. `None` for `OVK::None` outputs — falls back to the v4 (cmx-only) wire format for that action. |
-| `esk` | `Option<[u8; 32]>` | Reserved / unused on the wire — `esk` is derived on-device from `rseed + rho` per ZIP-212. The field is kept in the struct for API completeness but always `None` in normal SDK flows. |
+| `memo` | `Option<[u8; 512]>` | **Output-note memo plaintext** (ZIP-302). Recovered on the host side by trial-decrypting `out_ciphertext` with the device's external OVK (`try_output_recovery_with_ovk`). Sent as the trailing 512 bytes of the memo-verifying wire format so the device can recompute `enc_ciphertext` and reject any host that embeds a different memo on chain than what the user is shown. `None` for `OVK::None` outputs — falls back to the cmx-only wire format for that action. |
+| `esk` | `Option<[u8; 32]>` | Legacy field, always `None` in the current workflow — `esk` is derived on-device from `rseed + rho` per ZIP-212 and never transmitted. Only the legacy `serialize_v5()` format would carry it. |
 
-Wire formats: `ActionData::serialize_v5()` emits the **1415-byte** v5 payload (memo present, esk derived on-device); `ActionData::serialize()` emits the **903-byte** v4 fallback (cmx-only) when memo is `None`. The SDK's `DeviceSigner` calls `serialize_v5().unwrap_or_else(|| serialize())` so each action picks the strongest payload it can produce.
+Wire formats: for v6 (NU6.3/Ironwood) transactions `ActionData::serialize_v6()` emits the pool-tagged **1416-byte** memo-verifying payload, or the pool-tagged **904-byte** cmx-only form when `memo` is `None`. For legacy v5 transactions the SDK emits the **903-byte** v4 cmx-only payload via `ActionData::serialize()` (the legacy `serialize_v5()` — 1447 bytes, memo + esk on the wire — requires an `esk` the workflow never populates, so it is effectively unused). `DeviceSigner` selects the format from `TxMeta::is_v6()`.
 
 The trailing `(recipient, value, rseed, memo)` block is what closes both the recipient-substitution attack AND the memo-substitution attack a hostile companion would otherwise mount inside the Orchard bundle. Without `recipient/value/rseed` the device cannot verify cmx; without `memo` it cannot verify enc_ciphertext. With both, it recomputes Sinsemilla-NoteCommit + ChaCha20-Poly1305 on-device and rejects any swap.
 
@@ -470,8 +471,8 @@ The wallet application drives network selection by passing `coin_type` in HWP pr
 
 **How it works:**
 
-1. **`PcztHardwareSigning::new(signer, Network::TestNetwork)`** — the workflow requires an explicit `Network` parameter
-2. **`export_fvk(coin_type)`** — the SDK sends `coin_type` in `FvkReq` payload; the device derives keys from `m/32'/coin_type'/account'`
+1. **`coin_type` fixed at signer construction** — every `DeviceSigner` constructor (and the `connect_*` helpers) takes a `coin_type` (133 = mainnet, 1 = testnet), exposed through the required `HardwareSigner::coin_type()` method; the workflow derives the network from it
+2. **`export_fvk()`** — the SDK sends the signer's `coin_type` in the `FvkReq` payload; the device derives keys from `m/32'/coin_type'/account'`
 3. **`TxMeta`** carries `coin_type` (bytes 125-128) — the device validates that it matches the `coin_type` from `FvkReq`
 4. **Pre-proof validation** — the SDK rejects branch IDs that predate the Orchard protocol (pre-Nu5) before expensive Halo2 proof generation, and rejects v6 transactions whose branch ID predates NU6.3
 
@@ -534,7 +535,7 @@ The SDK closes this by recovering the memo and forwarding it to the device for f
 
 1. `workflow.rs` calls `signer.export_fvk()` to obtain the device's Orchard FVK and derives the external `OutgoingViewingKey` (`fvk.to_ovk(Scope::External)`)
 2. For each `pczt::Action`, it calls `try_output_recovery_with_ovk` from `zcash_note_encryption`, decrypting `out_ciphertext` and then `enc_ciphertext` to recover `(note, address, memo)`
-3. The memo plaintext is stored in `ActionData::memo` and shipped to the device as the trailing 512 bytes of the v5 wire payload
+3. The memo plaintext is stored in `ActionData::memo` and shipped to the device as the trailing 512 bytes of the memo-verifying wire payload (pool-tagged v6 format, 1416 B)
 4. The device recomputes `enc_ciphertext = ChaCha20-Poly1305(K_enc, IV=0, leadByte‖d‖value‖rseed‖memo)` with `K_enc = BLAKE2b("Zcash_OrchardKDF", repr_P(epk)‖repr_P([esk]·pk_d))` and `esk = ToScalar(PRF^expand(rseed,[0x04]‖ρ))` derived on-chip; ct-compares byte-for-byte against the action's `enc_ciphertext` AND `ephemeral_key`. Mismatch → `MemoMismatch` (HWP error `0x0F`).
 
 `esk` is **not** carried on the wire — both sides derive it deterministically from `rseed + rho` per ZIP-212, removing one trust-from-companion vector.
@@ -562,14 +563,14 @@ Defence:
 3. The fee is rendered on the trusted screen (via a dedicated `ui.review_fee` callback if the firmware provides one, or via a backward-compat fallback to `ui.review_output` with `addr_str = "Network fee"`)
 4. Only after explicit user OK does the dispatcher call `orchard_signer_confirm_fee()`, allowing `orchard_signer_verify()` to advance past `FeeNotConfirmed`
 
-The SDK does not need any change for this either; the fee math + confirmation flow is fully device-side and is driven automatically by the HWP dispatcher in `libzcash-orchard-c`.
+The SDK does not need any change for this either; the fee math + confirmation flow is fully device-side and is driven automatically by the HWP dispatcher in `libzcash-ironwood-c`.
 
 ### Protocol flow (integrated into `sign()`)
 
-1. SDK extracts `TxMeta` from the PCZT (129 bytes)
+1. SDK extracts `TxMeta` from the PCZT (129 bytes v5 / 170 bytes v6)
 2. `TxMeta` is sent as a `TxOutput` with `output_index = 0xFFFF` (metadata sentinel)
 3. SDK fetches OVK from device (via `signer.export_fvk()`) and trial-decrypts each action's `out_ciphertext` → `enc_ciphertext` to recover the memo plaintext
-4. SDK extracts each action's full components (1415 bytes per action) — including the unencrypted `recipient[43]`, `value[8]`, `rseed[32]`, and `memo[512]`. Falls back to the 903-byte cmx-only payload when memo recovery fails (`OVK::None` output).
+4. SDK extracts each action's full components (pool-tagged 1416 bytes per action under v6) — including the unencrypted `recipient[43]`, `value[8]`, `rseed[32]`, and `memo[512]`. Falls back to the cmx-only payload (904 B v6 / 903 B v5) when memo recovery fails (`OVK::None` output).
 5. Each action is sent as a `TxOutput` message (index 0..N-1)
 6. Device recomputes cmx AND (when the full payload is sent) enc_ciphertext + epk; stores recipient/value for display
 7. SDK sends the expected sighash as a sentinel `TxOutput` (index = N)
@@ -578,11 +579,11 @@ The SDK does not need any change for this either; the fee math + confirmation fl
 10. On subsequent `SignReq`, device verifies the sighash and `state == VERIFIED`
 11. RedPallas signature produced
 
-**Device-side implementation** is provided by [libzcash-orchard-c](https://github.com/wh00hw/libzcash-ironwood-c) — `zip244.h`/`zip244.c` for the digest tree, `orchard.c` for `orchard_compute_cmx` + `orchard_encode_ua_raw`, `orchard_signer.c` for the state machine.
+**Device-side implementation** is provided by [libzcash-ironwood-c](https://github.com/wh00hw/libzcash-ironwood-c) — `zip244.h`/`zip244.c` for the digest tree, `orchard.c` for `orchard_compute_cmx` + `orchard_encode_ua_raw`, `orchard_signer.c` for the state machine.
 
 **Note:** The SDK uses `Pczt::into_effects()` and `TxIdDigester` from `zcash_primitives` to extract the transparent sub-digest. This ensures the value is identical to what the official `pczt::roles::signer::Signer` uses internally for sighash computation. The `TxMeta` is built from the `TransactionData` directly (not from PCZT Global fields) to guarantee field-level consistency (e.g., `lock_time` determined by `determine_lock_time()`). The sapling digest field in `TxMeta` is always the empty-bundle constant by SDK invariant.
 
-**For custom `HardwareSigner` implementations:** the `verify_sighash()` trait method has a default no-op (v1 behavior: device trusts companion). Override it if your device supports on-device verification — and if it does, it MUST also implement the cmx + per-output confirmation flow, because the device-side libzcash-orchard-c refuses to sign without them.
+**For custom `HardwareSigner` implementations:** the `verify_transaction()` trait method has a default no-op (v1 behavior: device trusts companion). Override it if your device supports on-device verification — and if it does, it MUST also implement the cmx + per-output confirmation flow, because the device-side libzcash-ironwood-c refuses to sign without them.
 
 ## Security Model
 
@@ -598,14 +599,15 @@ The SDK does not need any change for this either; the fee math + confirmation fl
 | **Sapling-component lockout** | SDK rejects any PCZT with Sapling spends or outputs (`HwSignerError::SaplingNotSupported`) before transmission; device additionally enforces `sapling_digest == ZIP-244 empty-bundle constant` on `TxMeta` receipt. Prevents value siphoning via a hidden Sapling output the device never sees in the Orchard stream. | Active (via `DeviceSigner` + workflow) |
 | **NoteCommitment (cmx) verification** | Device recomputes `cmx = Extract_P(NoteCommit(g_d, pk_d, value, rho, psi))` for every Orchard action from the unencrypted note plaintext the SDK appends to each `TxOutput` payload, and rejects mismatches (`SIGNER_ERR_NOTE_COMMITMENT_MISMATCH`). Prevents a hostile companion from substituting the recipient between the displayed UI and the on-chain effect of the signed transaction. | Active (via `DeviceSigner`) |
 | **No-blind-signing invariant (per output)** | Device-side library refuses to advance the signer state to `VERIFIED` unless every captured action has been explicitly confirmed via `orchard_signer_confirm_action()`. The firmware UI is responsible for displaying recipient + value per output and capturing user approval; the lib enforces that without that step, no signature is produced. | Active (device-enforced) |
-| **Memo verification via enc_ciphertext recomputation** | SDK recovers each output's memo via the device's OVK (`try_output_recovery_with_ovk`) and ships it in the v5 wire payload. Device re-encrypts on-chip (Pallas ECDH + Orchard KDF + ChaCha20-Poly1305, esk derived from rseed+ρ per ZIP-212) and ct-compares against the action's `enc_ciphertext` + `ephemeral_key`; mismatch → `SIGNER_ERR_MEMO_MISMATCH`. Prevents a hostile companion from showing one memo on its UI and embedding another on chain. | Active (via `DeviceSigner` + workflow) |
+| **Memo verification via enc_ciphertext recomputation** | SDK recovers each output's memo via the device's OVK (`try_output_recovery_with_ovk`) and ships it in the memo-verifying wire payload (pool-tagged v6). Device re-encrypts on-chip (Pallas ECDH + Orchard KDF + ChaCha20-Poly1305, esk derived from rseed+ρ per ZIP-212) and ct-compares against the action's `enc_ciphertext` + `ephemeral_key`; mismatch → `SIGNER_ERR_MEMO_MISMATCH`. Prevents a hostile companion from showing one memo on its UI and embedding another on chain. | Active (via `DeviceSigner` + workflow) |
 | **Miner-fee confirmation invariant** | Device computes `fee = transparent_in − transparent_out + value_balance` on-chip with overflow + negative detection, renders it on the trusted screen, and refuses to advance `verify()` until the user explicitly approves (`orchard_signer_confirm_fee()`). Prevents `value_balance` inflation that would silently siphon the surplus to miners. | Active (device-enforced) |
 
 **Protocol hardening:**
 
+- **Device attestation** — first pairing stores the device's identity pubkey (`DeviceSigner::pair()`); later sessions verify a fresh RedPallas challenge-response against the pinned key (`new_with_pinned_pubkey` / `attest`), catching USB-hub MITM, TCP impostors, and reflashed devices
 - **Constant-time comparisons** — RK verification uses `subtle::ConstantTimeEq` to prevent timing side-channel attacks
 - **Zeroize on drop** — `SignRequest`, `SignResponse`, and `ExportedFvk` implement `Zeroize + ZeroizeOnDrop` to scrub sighash, alpha, signatures, and key material from memory
-- **Recipient validation** — Recipient addresses exceeding 127 bytes are rejected (no silent truncation)
+- **Recipient validation** — Recipient addresses exceeding 255 bytes are rejected (no silent truncation)
 - **Keepalive limits** — All PING loops are capped to prevent infinite loops from misbehaving devices
 - **Sighash log truncation** — Only first 8 bytes of sighash are logged to limit exposure
 
@@ -636,8 +638,8 @@ let proposal = /* propose_transfer(...) */;
 // 2. Create PCZT from proposal (FVK only, no spending key)
 let pczt_bytes = create_pczt_from_proposal(&mut db, &params, account_id, OvkPolicy::Sender, &proposal)?;
 
-// 3. Sign via hardware wallet (this SDK)
-let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0")?;
+// 3. Sign via hardware wallet (this SDK) — coin_type 133 = mainnet
+let signer = zcash_hw_wallet_sdk::signer::connect_serial("/dev/ttyACM0", 133)?;
 let mut workflow = PcztHardwareSigning::new(signer);
 let result = workflow.sign(pczt_bytes.serialize())?;
 
@@ -662,9 +664,9 @@ The SDK is **hardware-agnostic** -- implement the `HardwareSigner` trait or spea
 
 **Other potential targets:** Ledger Stax/Flex, Trezor, air-gapped phones, RISC-V microcontrollers, DIY hardware wallets.
 
-### Device-side: libzcash-orchard-c
+### Device-side: libzcash-ironwood-c
 
-The companion library [**libzcash-orchard-c**](https://github.com/wh00hw/libzcash-ironwood-c) provides a pure C11 implementation of the Zcash Orchard primitives and the HWP protocol, designed specifically for embedded hardware wallets where Rust is not available.
+The companion library [**libzcash-ironwood-c**](https://github.com/wh00hw/libzcash-ironwood-c) (formerly `libzcash-orchard-c`) provides a pure C11 implementation of the Zcash Orchard/Ironwood primitives and the HWP protocol, designed specifically for embedded hardware wallets where Rust is not available.
 
 It includes:
 
@@ -675,39 +677,41 @@ It includes:
 - **secp256k1 / ECDSA** — curve arithmetic (constant-time Montgomery ladder), ECDSA signing with RFC 6979, DER encoding (Transparent)
 - **Orchard Unified Address** generation with F4Jumble (ZIP-316) and Bech32m
 - **Base58Check + transparent address rendering** — `script_to_taddr()` decodes P2PKH/P2SH `script_pubkey` to the Zcash t-address string (mainnet `t1`/`t3`, testnet `tm`/`t2`), so the device shows the actual destination of transparent outputs (shielded → t-addr sweep) instead of only the change Orchard receivers
-- **HWP v5 protocol** implementation matching this SDK's host-side protocol, including the memo-verifying action payload and the on-chip fee computation
+- **HWP v2–v6 protocol** implementation matching this SDK's host-side protocol, including the memo-verifying + pool-tagged action payloads, device attestation, and the on-chip fee computation
 - **Target-agnostic protocol dispatcher** (`hwp_dispatcher.h`) — the full device-side state machine (drain → parse → switch → reply, PING/PONG keepalive, IDLE detection, multi-frame drain handling, per-output review, recipient binding, fee review) lives in the library and is exposed through a callback-based API. A new device target wires up ~6 I/O + UI callbacks and gets the protocol implementation for free. The Rust SDK ↔ libzcash protocol contract is therefore mirrored on both sides by one canonical implementation each, not re-derived per device target.
 - **Orchard note-encryption recomputation** — `orchard_compute_enc_ciphertext{,_from_rseed}` rebuilds the 580-byte AEAD ciphertext on-chip for memo verification (Pallas ECDH + `BLAKE2b("Zcash_OrchardKDF", ...)` + ChaCha20-Poly1305)
 - **Crypto primitives**: BLAKE2b, SHA-256/512, HMAC, PBKDF2 (with optional progress callback for PIN unlock UI), AES-256 (FF1), ChaCha20-Poly1305 (RFC 7539, KAT-verified)
 - **BIP39** mnemonic generation
 - **Zero external dependencies** — portable to any platform with a C11 compiler
 
-Together, the two projects form a complete plug-and-play stack: `libzcash-orchard-c` runs on the device (firmware) and owns everything below the wire, `zcash-hw-wallet-sdk` runs on the host (wallet application) and owns everything above the wire, and the HWP protocol between them is the frozen contract that lets the two halves evolve independently. A new device firmware reduces to platform-specific I/O + UI glue; a new wallet application reduces to building PCZTs and calling `PcztHardwareSigning::sign_with_details()`.
+Together, the two projects form a complete plug-and-play stack: `libzcash-ironwood-c` runs on the device (firmware) and owns everything below the wire, `zcash-hw-wallet-sdk` runs on the host (wallet application) and owns everything above the wire, and the HWP protocol between them is the frozen contract that lets the two halves evolve independently. A new device firmware reduces to platform-specific I/O + UI glue; a new wallet application reduces to building PCZTs and calling `PcztHardwareSigning::sign_with_details()`.
 
 ## librustzcash Compatibility
 
-This SDK uses the **librustzcash `main` branch** (included as a git submodule) because the hardware wallet signing APIs it depends on are already merged upstream but **not yet published to crates.io** as a new release:
+The SDK builds against the **published NU6.3-capable releases on crates.io** — `pczt 0.8.0-rc.1`, `orchard 0.15.0`, `zcash_primitives 0.29.0`, `zcash_protocol 0.10.0`. No `[patch.crates-io]` section is needed for a standalone build. The external-signing APIs it relies on are:
 
 - **`pczt`** — `Signer::shielded_sighash()` returns the computed sighash for external signing
-- **`pczt`** — `Signer::apply_orchard_signature(index, signature)` injects an externally-produced RedPallas signature
-- **`pczt`** — `low_level_signer::sign_orchard_with()` provides callback access to the parsed `orchard::pczt::Bundle` for reading alpha, rk, and action data
+- **`pczt`** — `Signer::apply_orchard_signature(index, signature)` / `apply_ironwood_signature(index, signature)` inject an externally-produced RedPallas signature per pool
+- **`pczt`** — `low_level_signer::sign_orchard_with()` / `sign_ironwood_with()` provide callback access to the parsed bundle for reading alpha, rk, and action data
 
-These were added in commit [`feefa606`](https://github.com/zcash/librustzcash/commit/feefa606) ("pczt: Support appending external signatures to inputs", Nov 2025) and are available in librustzcash `main` but not in the published `pczt` 0.5.1 on crates.io.
-
-Once a new pczt release is published, the `[patch.crates-io]` section in `Cargo.toml` and the librustzcash submodule can be removed.
+These first landed upstream in commit [`feefa606`](https://github.com/zcash/librustzcash/commit/feefa606) ("pczt: Support appending external signatures to inputs", Nov 2025) and have shipped on crates.io since `pczt` 0.6.0; the Ironwood (PCZT v2) APIs shipped with `pczt` 0.8. The `librustzcash` git submodule in this repo is kept for reference only and is not part of the build. (When the SDK is built as a path dependency of the `zipher-app` workspace, the workspace root may still patch the zcash crates to a pinned librustzcash revision.)
 
 ## Dependencies
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `pczt` | 0.7 | PCZT roles (prover, signer, extractor) — Ironwood-aware (PCZT v2) |
-| `orchard` | 0.15.0-pre.2 | Orchard-protocol circuit keys, Ironwood pool, V3 notes |
+| `pczt` | 0.8.0-rc.1 | PCZT roles (prover, signer, extractor) — Ironwood-aware (PCZT v2) |
+| `orchard` | 0.15.0 | Orchard-protocol circuit keys, Ironwood pool, V3 notes |
+| `zcash_primitives` | 0.29.0 | Transaction data, `TxIdDigester`, transparent sighash |
+| `zcash_protocol` | 0.10.0 | Consensus parameters, branch IDs |
+| `zcash_address` | 0.13 | Unified Address encoding for display |
 | `reddsa` | 0.5 | RedPallas signature verification |
 | `secp256k1` | 0.29 | ECDSA transparent signature parsing |
 | `ff` | 0.13 | Finite field traits (alpha serialization) |
-| `zcash_note_encryption` | 0.4 | Trial-decrypt `out_ciphertext` → `enc_ciphertext` via the device OVK to recover the memo plaintext for v5 memo-verification |
+| `zcash_note_encryption` | 0.4 | Trial-decrypt `out_ciphertext` → `enc_ciphertext` via the device OVK to recover the memo plaintext for memo-verification |
 | `zeroize` | 1 | Secure memory erasure for sensitive data |
 | `subtle` | 2 | Constant-time cryptographic comparisons |
+| `rand_core` | 0.6 | Fresh attestation challenge nonces (platform CSPRNG) |
 | `serialport` | 4 | USB serial (optional, feature `serial`) |
 | `hidapi` | 2 | Ledger USB HID (optional, feature `ledger`) |
 | `thiserror` | 2 | Error type derivation |
@@ -724,9 +728,10 @@ Once a new pczt release is published, the `[patch.crates-io]` section in `Cargo.
 - [x] **Sapling-component lockout** — SDK pre-rejects PCZTs with Sapling components; device enforces `sapling_digest == empty-bundle constant`.
 - [x] **NoteCommitment (cmx) verification** — Device recomputes Sinsemilla NoteCommit per action and rejects recipient-substitution attempts. KAT against `librustzcash` Note::commitment().
 - [x] **No-blind-signing invariant (per output)** — Device-side library state machine refuses to sign without explicit per-output user confirmation. Reference port (ESP32) confirms via BOOT button + CDC log; FlipZcash confirms via screen + OK button.
-- [x] **Memo verification via enc_ciphertext recomputation** — SDK recovers each output's memo via the device's OVK and ships it in the v5 wire payload (1415 B). Device re-encrypts on-chip (Pallas ECDH + Orchard KDF + ChaCha20-Poly1305 RFC 7539, esk derived from rseed+ρ per ZIP-212) and ct-compares against the action's `enc_ciphertext` + `ephemeral_key`. Closes the memo-substitution attack hanh raised.
+- [x] **Memo verification via enc_ciphertext recomputation** — SDK recovers each output's memo via the device's OVK and ships it in the memo-verifying wire payload (pool-tagged v6, 1416 B). Device re-encrypts on-chip (Pallas ECDH + Orchard KDF + ChaCha20-Poly1305 RFC 7539, esk derived from rseed+ρ per ZIP-212) and ct-compares against the action's `enc_ciphertext` + `ephemeral_key`. Closes the memo-substitution attack hanh raised.
 - [x] **Miner-fee confirmation invariant** — Device computes the fee on-chip from `t_in − t_out + value_balance` (with overflow + negative detection), renders it on the trusted screen, and refuses to advance `verify()` until the user explicitly approves. Closes the `value_balance`-inflation attack.
-- [ ] **Upstream pczt release** — The SDK depends on librustzcash `main` (git submodule + `[patch.crates-io]`) for the external signing APIs. A new pczt crates.io release would remove this dependency.
+- [x] **Upstream pczt release** — Resolved: the SDK now builds against the published crates.io releases (`pczt 0.8.0-rc.1`, `orchard 0.15.0`); the librustzcash submodule and `[patch.crates-io]` table are no longer required.
+- [x] **Device attestation** — First-pairing identity pinning + per-session RedPallas challenge-response (`pair()` / `attest()` / `new_with_pinned_pubkey`, HWP 0x0F–0x12). Catches device substitution between sessions (audit M1).
 - [ ] **External security audit** — Required before any production/mainnet use
 - [ ] **QR transport testing** — The QR transport is untested with real hardware. Needs end-to-end validation with an air-gapped device.
 - [ ] **Sapling-only recipient support** — Out of scope for the Orchard-only design. Recipients with no Orchard receiver in their UA are not supported; recipients should expose a UA with an Orchard receiver. If ever needed, would require streaming sapling spends/outputs to the device for digest recomputation rather than the current empty-bundle enforcement.

@@ -2,9 +2,9 @@
 
 ## Summary
 
-The `zcash-hw-wallet-sdk` demonstrates that the PCZT external signing APIs already present in librustzcash `main` are sufficient for complete hardware wallet integration — no additional changes to upstream crates are needed.
+The `zcash-hw-wallet-sdk` demonstrates that the PCZT external signing APIs published in the `pczt` crate (0.8.0-rc.1) are sufficient for complete hardware wallet integration — no additional changes to upstream crates are needed.
 
-This document describes which APIs are used, how they enable the hardware wallet signing workflow, and why a new crates.io release of `pczt` would benefit the ecosystem.
+This document describes which APIs are used and how they enable the hardware wallet signing workflow.
 
 ## APIs Used
 
@@ -87,19 +87,16 @@ No shadow deserialization, no `pub(crate)` workarounds, no patched crates.
 
 ## Current Situation
 
-The external-signing APIs shipped on crates.io starting with `pczt` 0.6.0
-(current: **0.7.0**, 2026-06-03). The SDK still uses a `[patch.crates-io]`
-section pointing to a librustzcash git submodule (`bd1bc3fbe6`, post-0.7.0
-`main`), but for a new reason: the **Ironwood (NU6.3) PCZT v2 support** —
-the `ironwood` bundle field, `sign_ironwood_with`, `apply_ironwood_signature`,
-`create_ironwood_proof`, and the v6 sighash plumbing — was merged to `main`
-after the 0.7.0 release and is not yet published.
+The external-signing APIs shipped on crates.io starting with `pczt` 0.6.0.
+The **Ironwood (NU6.3) PCZT v2 support** — the `ironwood` bundle field,
+`sign_ironwood_with`, `apply_ironwood_signature`, `create_ironwood_proof`,
+and the v6 sighash plumbing — shipped with **`pczt` 0.8.0-rc.1**, alongside
+the matching `orchard 0.15.0`, `zcash_primitives 0.29.0`, and
+`zcash_protocol 0.10.0` releases of the NU6.3 activation stack (mainnet
+~2026-07-21).
 
-## Recommendation
-
-Publishing the NU6.3-capable `pczt` (and the matching `zcash_primitives` /
-`zcash_protocol` finals, currently `0.29.0-pre.0` / `0.10.0-pre.0`) to
-crates.io would let hardware-wallet SDKs drop the git submodule and patch
-table entirely. The Ironwood signing APIs follow the exact patterns of their
-Orchard counterparts — they require no changes, only a release, which is
-expected as part of the NU6.3 activation stack (mainnet ~2026-07-21).
+The SDK builds against those published releases directly: no
+`[patch.crates-io]` table and no librustzcash git checkout are required.
+The `librustzcash` submodule in this repository is retained for reference
+only. Everything this SDK needs for complete hardware-wallet integration —
+Orchard and Ironwood alike — is available on crates.io.

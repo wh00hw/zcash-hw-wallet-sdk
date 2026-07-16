@@ -227,10 +227,13 @@ fn test_msg_type_roundtrip() {
 
 #[test]
 fn test_error_code_roundtrip() {
-    for v in 0x01..=0x0Bu8 {
+    /* Range extended to 0x13 to cover the v5 device-side codes
+     * (MemoMismatch=0x0F .. FeeNegative=0x13). */
+    for v in 0x01..=0x13u8 {
         let ec = protocol::ErrorCode::from_u8(v);
         assert_eq!(ec as u8, v);
     }
+    assert_eq!(protocol::ErrorCode::from_u8(0x14), protocol::ErrorCode::Unknown);
     assert_eq!(protocol::ErrorCode::from_u8(0xFF), protocol::ErrorCode::Unknown);
 }
 
@@ -455,7 +458,6 @@ mod ironwood_wire_tests {
             value: 42,
             rseed: [9; 32],
             memo,
-            esk: None,
         }
     }
 

@@ -241,23 +241,21 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
             info!("Transparent digest verified — device confirmed match.");
         }
 
-        // 3. Send each shielded action's ZIP-244 data. Prefer the memo-
-        //    verifying wire format (memo + esk appended) so the device can
-        //    recompute enc_ciphertext on-chip and reject any host that
-        //    embeds a different memo on chain than what the user is
-        //    shown. Fall back to the cmx-only payload if memo/esk were not
-        //    recoverable for this action (OVK-None output).
+        // 3. Send each shielded action's ZIP-244 data.
         //
         //    v6 (NU6.3 / Ironwood) transactions prefix each payload with a
         //    pool byte (0x00 Orchard, 0x01 Ironwood) so the device hashes
-        //    the action into the correct pool digest tree; v5 transactions
-        //    keep the legacy untagged formats.
+        //    the action into the correct pool digest tree, and append the
+        //    memo (when recoverable — not an OVK-None output) so the device
+        //    can recompute enc_ciphertext on-chip and reject any host that
+        //    embeds a different memo on chain than what the user is shown.
+        //    Legacy v5 transactions use the untagged cmx-only v4 format.
         let v6 = meta.is_v6();
         for (i, action) in actions.iter().enumerate() {
             let output_data = if v6 {
                 action.serialize_v6()
             } else {
-                action.serialize_v5().unwrap_or_else(|| action.serialize())
+                action.serialize()
             };
             self.codec
                 .send_tx_output(i as u16, total_actions, &output_data)?;
@@ -267,7 +265,6 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
                 total_actions,
                 output_data.len(),
                 match output_data.len() {
-                    1447 | 1415 => "v5",
                     1416 | 904 => "v6",
                     _ => "v4",
                 },

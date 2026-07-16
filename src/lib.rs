@@ -12,9 +12,9 @@
 //!
 //! This crate wraps the PCZT workflow for hardware wallet use cases:
 //!
-//! 1. Define the [`HardwareSigner`] trait that any device can implement (4 methods, 2 have defaults)
+//! 1. Define the [`HardwareSigner`] trait that any device can implement (3 required methods, 3 with defaults)
 //! 2. Provide [`PcztHardwareSigning`] to orchestrate the signing pipeline
-//! 3. Ship transport implementations for Serial and QR
+//! 3. Ship transport implementations for Serial, Ledger HID, Speculos, TCP, and QR
 //! 4. Include [`DeviceSigner`] as a ready-to-use HWP-based signer
 //!
 //! ## Quick Start

@@ -1,8 +1,11 @@
 //! Transport layer abstractions for communicating with hardware wallets.
 //!
-//! The SDK ships with two transport implementations:
-//! - [`SerialTransport`] — USB CDC serial (for microcontrollers, Arduino, ESP32, etc.)
-//! - [`QrTransport`] — animated QR codes (for air-gapped devices)
+//! The SDK ships with five transport implementations, gated by feature flags:
+//! - [`SerialTransport`] — USB CDC serial (for microcontrollers, Arduino, ESP32, etc.; feature `serial`)
+//! - [`LedgerTransport`] — USB HID for Ledger devices (feature `ledger`)
+//! - [`SpeculosTransport`] — TCP to the Speculos emulator (feature `ledger`)
+//! - [`TcpTransport`] — raw TCP for the virtual test device (feature `tcp`)
+//! - [`QrTransport`] — animated QR codes (for air-gapped devices; feature `qr`, untested)
 
 #[cfg(feature = "serial")]
 mod serial;

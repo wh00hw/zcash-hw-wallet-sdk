@@ -132,6 +132,21 @@ pub enum ErrorCode {
     /// match any of the per-output recipients the user just confirmed —
     /// hostile companion lying about the destination (v4).
     RecipientMismatch = 0x0E,
+    /// Device-recomputed `enc_ciphertext` (or epk) does not match the
+    /// action's fields — memo-substitution attempt (v5).
+    MemoMismatch = 0x0F,
+    /// `pk_d` in the claimed note plaintext does not decode to a valid
+    /// Pallas point (v5).
+    BadPkD = 0x10,
+    /// `verify()` was reached without the user approving the on-device-
+    /// computed miner fee (v5).
+    FeeNotConfirmed = 0x11,
+    /// Transparent value sums or `value_balance` combine to an
+    /// out-of-range fee (v5).
+    FeeOverflow = 0x12,
+    /// `t_in + value_balance < t_out` — the companion built an unbalanced
+    /// bundle (v5).
+    FeeNegative = 0x13,
 }
 
 impl ErrorCode {
@@ -151,6 +166,11 @@ impl ErrorCode {
             0x0C => Self::SaplingNotEmpty,
             0x0D => Self::NoteCommitmentMismatch,
             0x0E => Self::RecipientMismatch,
+            0x0F => Self::MemoMismatch,
+            0x10 => Self::BadPkD,
+            0x11 => Self::FeeNotConfirmed,
+            0x12 => Self::FeeOverflow,
+            0x13 => Self::FeeNegative,
             _ => Self::Unknown,
         }
     }
