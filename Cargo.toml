@@ -76,36 +76,6 @@ ur = { version = "0.4", optional = true }
 tokio = { version = "1", features = ["full"] }
 blake2b_simd = "1"
 
-# [patch.crates-io] — vendored librustzcash submodule
-# ============================================================================
-# The four `path = "librustzcash/..."` entries below redirect crates.io
-# resolution to the in-tree submodule at `librustzcash/`. The submodule is
-# git-pinned via `.gitmodules` to a specific upstream commit; the SHA is
-# recorded in the parent repo's tree and verified at clone time only when
-# someone runs `git submodule update --init`.
-#
-# Pinned commit (audit H4 — keep this in sync with the actual submodule HEAD):
-#   librustzcash @ bd1bc3fbe6b9168c9654db2b3a7fdc5e7b1c15f8 (NU6.3 / Ironwood)
-#
-# To verify the submodule is at the documented commit before a release:
-#   git -C librustzcash rev-parse HEAD
-#   # must match the SHA above
-#
-# When upgrading librustzcash:
-#   1. update the submodule: `cd librustzcash && git fetch && git checkout <new-sha>`
-#   2. update the SHA comment above
-#   3. run `cargo update -p pczt -p zcash_primitives -p zcash_protocol -p zcash_address`
-#   4. re-run the integration tests + the security-audit reports
-#
-# Long-term we want to drop this patch table entirely once `pczt` ships a
-# stable release on crates.io with the hardware-wallet-signer API surface.
-# Audit: docs/security-audit/04-host-sdk-rust.md H4.
-[patch.crates-io]
-pczt = { path = "librustzcash/pczt" }
-zcash_primitives = { path = "librustzcash/zcash_primitives" }
-zcash_protocol = { path = "librustzcash/components/zcash_protocol" }
-zcash_address = { path = "librustzcash/components/zcash_address" }
-=======
 # NOTE: no [patch.crates-io] here — when built as a path dependency of
 # zipher-app, the workspace root patches all zcash crates to librustzcash
 # rev 292e7584 (NU6.3 / Ironwood). Building this SDK standalone requires
