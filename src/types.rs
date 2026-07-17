@@ -8,6 +8,11 @@ pub const COIN_TYPE_MAINNET: u32 = 133;
 /// ZIP-32 coin type for testnet.
 pub const COIN_TYPE_TESTNET: u32 = 1;
 
+/// The v6 transaction version header (NU6.3 / Ironwood): overwintered bit
+/// set, version 6. The only transaction version this v6-only host signs;
+/// mirrors the device's `ZIP244_V6_TX_VERSION` check.
+pub const V6_TX_VERSION: u32 = 0x8000_0006;
+
 /// Map a [`Network`] to the corresponding ZIP-32 coin type.
 pub fn coin_type_for_network(network: &Network) -> u32 {
     match network {
@@ -151,8 +156,8 @@ impl ExportedFvk {
 /// The shielded value pool an action belongs to (NU6.3 / Ironwood).
 ///
 /// Wire encoding: a single byte prefixed to each action payload in the v6
-/// transaction wire format (`0x00` = Orchard, `0x01` = Ironwood). v5
-/// transactions carry no pool byte — every action is implicitly Orchard.
+/// transaction wire format (`0x00` = Orchard, `0x01` = Ironwood). The tag
+/// is mandatory — the strict v6-only device rejects untagged payloads.
 ///
 /// The pool also selects the note-plaintext version the device uses when
 /// recomputing cmx / enc_ciphertext: Orchard notes are ZIP-212 V2 (lead byte
@@ -175,18 +180,18 @@ impl ShieldedPoolKind {
     }
 }
 
-/// Serialized action data for on-device sighash verification (HWP v2).
+/// Serialized action data for on-device sighash verification.
 ///
 /// Contains all the fields the device needs to independently compute
-/// the ZIP-244 orchard actions digest and verify the sighash.
+/// the ZIP-244 pool actions digest and verify the sighash.
 ///
-/// Wire format per action (v4):
-/// `cv_net(32) || nullifier(32) || rk(32) || cmx(32) || ephemeral_key(32) ||
-///   enc_ciphertext(580) || out_ciphertext(80) ||
-///   recipient(43) || value(8 LE) || rseed(32)`
-/// Total: 903 bytes
+/// Wire format (v6, the only tier this host emits — see [`Self::serialize_v6`]):
+/// `pool_tag(1) || cv_net(32) || nullifier(32) || rk(32) || cmx(32) ||
+///   ephemeral_key(32) || enc_ciphertext(580) || out_ciphertext(80) ||
+///   recipient(43) || value(8 LE) || rseed(32) [|| memo(512)]`
+/// Total: 904 bytes (compact, cmx-only) or 1416 bytes (memo-verifying).
 ///
-/// The trailing 83 bytes (recipient/value/rseed) are the unencrypted note plaintext.
+/// The recipient/value/rseed trailer is the unencrypted note plaintext.
 /// They are required so the device can recompute the action's NoteCommitment and
 /// verify it matches the cmx field of the encrypted action — without this, a
 /// hostile companion could swap the recipient between the displayed UI and the
@@ -222,16 +227,17 @@ pub struct ActionData {
     /// Populated when the workflow has recovered it from `out_ciphertext` via
     /// the sender's outgoing viewing key. `None` for outputs sent with
     /// `OVK::None` (deliberately unrecoverable by the sender) — in that case
-    /// the v5 memo-verifying wire format is not used for this action and the
-    /// device falls back to cmx-only verification (v4 behaviour).
+    /// the memo-verifying wire format is not used for this action and the
+    /// device falls back to cmx-only verification.
     pub memo: Option<[u8; 512]>,
 }
 
 impl ActionData {
-    /// Serialize to the v4 wire format for TxOutput messages (903 bytes) —
-    /// cmx verification only. Used for legacy (pre-NU6.3) v5 sessions and
-    /// as the base of the v6 format.
-    pub fn serialize(&self) -> Vec<u8> {
+    /// Serialize the untagged 903-byte action body — cmx verification only.
+    /// This is the base of both v6 wire formats; it is never sent on the
+    /// wire by itself (the strict v6-only device rejects untagged payloads
+    /// with `Error(BAD_FRAME)`), so it is private to this module.
+    fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
             32 + 32 + 32 + 32 + 32
                 + self.enc_ciphertext.len()
@@ -245,7 +251,7 @@ impl ActionData {
         buf.extend_from_slice(&self.ephemeral_key);
         buf.extend_from_slice(&self.enc_ciphertext);
         buf.extend_from_slice(&self.out_ciphertext);
-        // v4 note plaintext suffix
+        // note plaintext suffix
         buf.extend_from_slice(&self.recipient);
         buf.extend_from_slice(&self.value.to_le_bytes());
         buf.extend_from_slice(&self.rseed);
@@ -254,11 +260,11 @@ impl ActionData {
 
     /// Serialize to the v6 wire format for TxOutput messages: a 1-byte pool
     /// tag (`0x00` Orchard, `0x01` Ironwood) followed by the memo-verifying
-    /// payload (v4 payload + memo[512], 1416 bytes total) or, when the memo
-    /// is unavailable, the cmx-only v4 payload (904 bytes total). esk is
-    /// never transmitted — the device derives it from (rseed, rho). Only
-    /// used for v6 (NU6.3+) transactions; the device strips the pool tag
-    /// and discriminates the format by the remaining payload size.
+    /// payload (903-byte body + memo[512], 1416 bytes total) or, when the
+    /// memo is unavailable, the cmx-only body (904 bytes total). esk is
+    /// never transmitted — the device derives it from (rseed, rho). This is
+    /// the only action wire format this host emits; the device strips the
+    /// pool tag and discriminates the format by the remaining payload size.
     pub fn serialize_v6(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1 + 903 + 512);
         buf.push(self.pool.to_byte());
@@ -342,25 +348,19 @@ impl TransparentOutputData {
 /// Contains the header fields and shielded bundle metadata that the device
 /// needs (together with action data) to independently compute the sighash.
 ///
-/// v5 wire format (129 bytes):
-/// `version[4 LE] || version_group_id[4 LE] || consensus_branch_id[4 LE] ||
-///  lock_time[4 LE] || expiry_height[4 LE] ||
-///  orchard_flags[1] || value_balance[8 LE signed] || anchor[32] ||
-///  transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`
-///
-/// v6 wire format (170 bytes, NU6.3 / Ironwood): inserts an Ironwood bundle
-/// section after the Orchard one:
+/// v6 wire format (170 bytes, NU6.3 / Ironwood — the only layout this host
+/// emits; the strict v6-only device rejects the legacy 129-byte v5 layout
+/// with `Error(BAD_META)`):
 /// `version[4 LE] || version_group_id[4 LE] || consensus_branch_id[4 LE] ||
 ///  lock_time[4 LE] || expiry_height[4 LE] ||
 ///  orchard_flags[1] || value_balance[8 LE signed] || anchor[32] ||
 ///  ironwood_flags[1] || ironwood_value_balance[8 LE signed] || ironwood_anchor[32] ||
 ///  transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`
 ///
-/// The device discriminates the two layouts by payload size. All bytes
-/// except the trailing `coin_type` feed ZIP-244 sighash computation. Note
-/// that under the v6 transaction format the anchors are NOT part of the
-/// txid/effects digest (they move to the authorizing-data commitment); they
-/// are still carried for display and consistency checks.
+/// All bytes except the trailing `coin_type` feed ZIP-244 sighash
+/// computation. Note that under the v6 transaction format the anchors are
+/// NOT part of the txid/effects digest (they move to the authorizing-data
+/// commitment); they are still carried for display and consistency checks.
 #[derive(Debug, Clone)]
 pub struct TxMeta {
     pub version: u32,
@@ -371,11 +371,11 @@ pub struct TxMeta {
     pub orchard_flags: u8,
     pub value_balance: i64,
     pub anchor: [u8; 32],
-    /// Ironwood bundle flag byte (v6 only; bit 2 = enableCrossAddress).
+    /// Ironwood bundle flag byte (bit 2 = enableCrossAddress).
     pub ironwood_flags: u8,
-    /// Ironwood bundle net value balance in zatoshis (v6 only).
+    /// Ironwood bundle net value balance in zatoshis.
     pub ironwood_value_balance: i64,
-    /// Ironwood bundle anchor (v6 only).
+    /// Ironwood bundle anchor.
     pub ironwood_anchor: [u8; 32],
     /// Pre-computed transparent signature digest (ZIP-244 S.2).
     pub transparent_sig_digest: [u8; 32],
@@ -386,17 +386,13 @@ pub struct TxMeta {
 }
 
 impl TxMeta {
-    /// Whether this transaction uses the v6 format (NU6.3 / Ironwood).
-    pub fn is_v6(&self) -> bool {
-        (self.version & 0x7FFF_FFFF) >= 6
-    }
-
     /// Serialize to the wire format for the TxOutput metadata message:
-    /// 129 bytes for v5 transactions, 170 bytes (with the Ironwood bundle
-    /// section) for v6. The device discriminates the layout by size. All
-    /// bytes except the trailing `coin_type[4]` feed sighash computation.
+    /// always the 170-byte v6 layout (with the Ironwood bundle section).
+    /// The legacy 129-byte v5 layout has been removed — this host is
+    /// v6-only. All bytes except the trailing `coin_type[4]` feed sighash
+    /// computation.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(if self.is_v6() { 170 } else { 129 });
+        let mut buf = Vec::with_capacity(170);
         buf.extend_from_slice(&self.version.to_le_bytes());
         buf.extend_from_slice(&self.version_group_id.to_le_bytes());
         buf.extend_from_slice(&self.consensus_branch_id.to_le_bytes());
@@ -405,11 +401,9 @@ impl TxMeta {
         buf.push(self.orchard_flags);
         buf.extend_from_slice(&self.value_balance.to_le_bytes());
         buf.extend_from_slice(&self.anchor);
-        if self.is_v6() {
-            buf.push(self.ironwood_flags);
-            buf.extend_from_slice(&self.ironwood_value_balance.to_le_bytes());
-            buf.extend_from_slice(&self.ironwood_anchor);
-        }
+        buf.push(self.ironwood_flags);
+        buf.extend_from_slice(&self.ironwood_value_balance.to_le_bytes());
+        buf.extend_from_slice(&self.ironwood_anchor);
         buf.extend_from_slice(&self.transparent_sig_digest);
         buf.extend_from_slice(&self.sapling_digest);
         buf.extend_from_slice(&self.coin_type.to_le_bytes());

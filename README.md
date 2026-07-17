@@ -251,9 +251,9 @@ pub trait Transport {
 
 `requires_handshake()` controls whether the initial PING/PONG exchange is performed. Serial devices send a PING on boot and expect PONG before accepting commands. Ledger devices are passive (APDU request-response) and return `false`.
 
-### `protocol` -- Hardware Wallet Protocol (HWP) v6
+### `protocol` -- Hardware Wallet Protocol (HWP) v6 only
 
-Binary framed protocol designed for constrained devices. v6 is the current feature tier (NU6.3 / Ironwood: pool-tagged action payloads, five-leaf sighash tree); earlier tiers layered in ZIP-244 sighash verification (v2), transparent digest verification + ECDSA signing (v3), Orchard cmx + per-action user confirmation + device attestation (v4), and on-device `enc_ciphertext` recomputation (memo binding) + explicit miner-fee confirmation (v5).
+Binary framed protocol designed for constrained devices. **This branch is v6-only** (post-NU6.3, intended for merge after Zcash mainnet activates NU6.3): the host emits exclusively the v6 wire tier — 170-byte TxMeta, pool-tagged 904/1416-byte action payloads, five-leaf sighash tree — and rejects any PCZT whose consensus branch ID predates NU6.3 or whose transaction version is not v6 before proof generation. The matching strict device (`libzcash-ironwood-c`, branch `v6-only`) rejects the legacy tiers on the wire: 125/129-byte v5 TxMeta → `Error(BAD_META)`, untagged 903/1415-byte actions → `Error(BAD_FRAME)`. Earlier tiers layered in ZIP-244 sighash verification (v2), transparent digest verification + ECDSA signing (v3), Orchard cmx + per-action user confirmation + device attestation (v4), and on-device `enc_ciphertext` recomputation (memo binding) + explicit miner-fee confirmation (v5); their security features all carry forward into v6, only their wire layouts are gone.
 
 **Frame format:**
 
@@ -311,8 +311,8 @@ output_index[2 LE] || total_outputs[2 LE] || action_data[N]
 
 Three types of TxOutput messages are used, discriminated by `output_index`:
 
-- `output_index = 0xFFFF` — **Transaction metadata**: `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE signed] || anchor[32] || transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]` (129 bytes, v5). The v6 (NU6.3/Ironwood) layout is 170 bytes — it inserts `ironwood_flags[1] || ironwood_value_balance[8 LE] || ironwood_anchor[32]` after the Orchard anchor; the device discriminates the tier by payload size.
-- `output_index = 0..N-1` — **Action + full note plaintext**. For v6 transactions (the only kind produced post-NU6.3) the SDK emits the **pool-tagged 1416-byte payload**: `pool_tag[1] || cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] || memo[512]`. The trailing 595 bytes (recipient + value + rseed + memo) let the device recompute both `cmx` (Sinsemilla) AND `enc_ciphertext` (ChaCha20-Poly1305 with `K_enc = BLAKE2b(epk‖[esk]·pk_d)`, esk derived on-chip from rseed+rho per ZIP-212). Closes both recipient-substitution and memo-substitution attacks. When the memo is not recoverable on the host side (`OVK::None` outputs) the pool-tagged **904-byte** cmx-only form is sent instead; the wallet's normal flow (`OvkPolicy::Sender`) does not use this fallback. For legacy v5 sessions the SDK sends the untagged 903-byte cmx-only payload (memo binding is exercised only under v6).
+- `output_index = 0xFFFF` — **Transaction metadata** (v6 layout, 170 bytes — the only one this host emits): `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE signed] || anchor[32] || ironwood_flags[1] || ironwood_value_balance[8 LE signed] || ironwood_anchor[32] || transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`. The legacy 129-byte v5 layout is rejected by the strict device (`Error/BAD_META`).
+- `output_index = 0..N-1` — **Action + full note plaintext**. For v6 transactions (the only kind produced post-NU6.3) the SDK emits the **pool-tagged 1416-byte payload**: `pool_tag[1] || cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] || memo[512]`. The trailing 595 bytes (recipient + value + rseed + memo) let the device recompute both `cmx` (Sinsemilla) AND `enc_ciphertext` (ChaCha20-Poly1305 with `K_enc = BLAKE2b(epk‖[esk]·pk_d)`, esk derived on-chip from rseed+rho per ZIP-212). Closes both recipient-substitution and memo-substitution attacks. When the memo is not recoverable on the host side (`OVK::None` outputs) the pool-tagged **904-byte** cmx-only form is sent instead; the wallet's normal flow (`OvkPolicy::Sender`) does not use this fallback. Untagged legacy 903/1415-byte payloads no longer exist on this branch — the strict device rejects them with `Error(BAD_FRAME)`.
 - `output_index = N` (sentinel): Expected 32-byte ZIP-244 sighash for device comparison. Triggers the per-output review loop on-device and then the fee-confirmation step (`get_fee` → user OK → `confirm_fee`) before final `verify()`.
 
 **Error codes:**
@@ -407,7 +407,7 @@ ZIP-244 action data + note plaintext sent to the device for on-device sighash + 
 
 `esk` is never part of the struct or the wire — the device derives it on-chip from `rseed + rho` per ZIP-212.
 
-Wire formats: for v6 (NU6.3/Ironwood) transactions `ActionData::serialize_v6()` emits the pool-tagged **1416-byte** memo-verifying payload, or the pool-tagged **904-byte** cmx-only form when `memo` is `None`. For legacy v5 transactions the SDK emits the **903-byte** v4 cmx-only payload via `ActionData::serialize()`. `DeviceSigner` selects the format from `TxMeta::is_v6()`.
+Wire formats: `ActionData::serialize_v6()` — the only action wire format on this branch — emits the pool-tagged **1416-byte** memo-verifying payload, or the pool-tagged **904-byte** cmx-only form when `memo` is `None`. The untagged 903-byte legacy serialization is private (it is only the base of the v6 formats) and never sent on the wire.
 
 The trailing `(recipient, value, rseed, memo)` block is what closes both the recipient-substitution attack AND the memo-substitution attack a hostile companion would otherwise mount inside the Orchard bundle. Without `recipient/value/rseed` the device cannot verify cmx; without `memo` it cannot verify enc_ciphertext. With both, it recomputes Sinsemilla-NoteCommit + ChaCha20-Poly1305 on-device and rejects any swap.
 
@@ -474,12 +474,12 @@ The wallet application drives network selection by passing `coin_type` in HWP pr
 
 1. **`coin_type` fixed at signer construction** — every `DeviceSigner` constructor (and the `connect_*` helpers) takes a `coin_type` (133 = mainnet, 1 = testnet), exposed through the required `HardwareSigner::coin_type()` method; the workflow derives the network from it
 2. **`export_fvk()`** — the SDK sends the signer's `coin_type` in the `FvkReq` payload; the device derives keys from `m/32'/coin_type'/account'`
-3. **`TxMeta`** carries `coin_type` (bytes 125-128) — the device validates that it matches the `coin_type` from `FvkReq`
-4. **Pre-proof validation** — the SDK rejects branch IDs that predate the Orchard protocol (pre-Nu5) before expensive Halo2 proof generation, and rejects v6 transactions whose branch ID predates NU6.3
+3. **`TxMeta`** carries `coin_type` (bytes 166-169) — the device validates that it matches the `coin_type` from `FvkReq`
+4. **Pre-proof validation** — v6-only: the SDK rejects any PCZT whose consensus branch ID predates NU6.3 (`0x37a5165b`) or whose transaction version is not v6 (`0x80000006`) before expensive Halo2 proof generation
 
 If a mismatch is detected (e.g., `FvkReq(coin_type=133)` followed by `TxMeta(coin_type=1)`), the device returns `NetworkMismatch` (error 0x05).
 
-The `coin_type` extension in TxMeta (the trailing 4 bytes: 125-128 in the v5 layout, 166-169 in the v6 layout) is **not** part of the ZIP-244 sighash computation — it is appended after the core fields for network validation only.
+The `coin_type` extension in TxMeta (the trailing 4 bytes, 166-169 in the v6 layout) is **not** part of the ZIP-244 sighash computation — it is appended after the core fields for network validation only.
 
 **Note:** `consensus_branch_id` values (e.g., Nu5 = `0xc2d6d0b4`, Nu6.3 = `0x37a5165b`) are identical on mainnet and testnet. Only `coin_type` (133 vs 1) reliably distinguishes the networks, because it determines the ZIP-32 key derivation path.
 
@@ -492,7 +492,8 @@ V3 quantum-recoverable note plaintexts per ZIP 2005). The SDK handles both:
 
 - **TxMeta v6 layout (170 bytes)**: inserts `ironwood_flags[1] ||
   ironwood_value_balance[8 LE] || ironwood_anchor[32]` after the Orchard
-  anchor. The device discriminates v5/v6 by payload size. Under v6 the anchors
+  anchor. This is the only layout on the wire — the strict device rejects
+  the legacy v5 sizes. Under v6 the anchors
   are *not* part of the effects digest (they move to the authorizing-data
   commitment), and the sighash tree gains a fifth leaf
   (`ZTxIdIronwd_H_v6`-personalized) after the Orchard one
@@ -512,7 +513,7 @@ The SDK + device cooperate to enforce five security invariants, in order, before
 
 ### 1. ZIP-244 sighash recomputed on-device
 
-Before signing, the SDK extracts transaction metadata and action data from the PCZT and sends them to the device. The device independently computes the complete ZIP-244 v5 shielded sighash and refuses to sign if it doesn't match.
+Before signing, the SDK extracts transaction metadata and action data from the PCZT and sends them to the device. The device independently computes the complete ZIP-244 v6 (five-leaf) shielded sighash and refuses to sign if it doesn't match.
 
 A compromised companion cannot trick the device into signing an arbitrary transaction — the device recomputes the sighash from the raw transaction components.
 
@@ -568,10 +569,10 @@ The SDK does not need any change for this either; the fee math + confirmation fl
 
 ### Protocol flow (integrated into `sign()`)
 
-1. SDK extracts `TxMeta` from the PCZT (129 bytes v5 / 170 bytes v6)
+1. SDK extracts `TxMeta` from the PCZT (170 bytes, v6 layout only)
 2. `TxMeta` is sent as a `TxOutput` with `output_index = 0xFFFF` (metadata sentinel)
 3. SDK fetches OVK from device (via `signer.export_fvk()`) and trial-decrypts each action's `out_ciphertext` → `enc_ciphertext` to recover the memo plaintext
-4. SDK extracts each action's full components (pool-tagged 1416 bytes per action under v6) — including the unencrypted `recipient[43]`, `value[8]`, `rseed[32]`, and `memo[512]`. Falls back to the cmx-only payload (904 B v6 / 903 B v5) when memo recovery fails (`OVK::None` output).
+4. SDK extracts each action's full components (pool-tagged 1416 bytes per action) — including the unencrypted `recipient[43]`, `value[8]`, `rseed[32]`, and `memo[512]`. Falls back to the pool-tagged cmx-only payload (904 B) when memo recovery fails (`OVK::None` output).
 5. Each action is sent as a `TxOutput` message (index 0..N-1)
 6. Device recomputes cmx AND (when the full payload is sent) enc_ciphertext + epk; stores recipient/value for display
 7. SDK sends the expected sighash as a sentinel `TxOutput` (index = N)
@@ -678,7 +679,7 @@ It includes:
 - **secp256k1 / ECDSA** — curve arithmetic (constant-time Montgomery ladder), ECDSA signing with RFC 6979, DER encoding (Transparent)
 - **Orchard Unified Address** generation with F4Jumble (ZIP-316) and Bech32m
 - **Base58Check + transparent address rendering** — `script_to_taddr()` decodes P2PKH/P2SH `script_pubkey` to the Zcash t-address string (mainnet `t1`/`t3`, testnet `tm`/`t2`), so the device shows the actual destination of transparent outputs (shielded → t-addr sweep) instead of only the change Orchard receivers
-- **HWP v2–v6 protocol** implementation matching this SDK's host-side protocol, including the memo-verifying + pool-tagged action payloads, device attestation, and the on-chip fee computation
+- **HWP v6-only protocol** implementation matching this SDK's host-side protocol (its own `v6-only` branch rejects the legacy v2–v5 wire tiers), including the memo-verifying + pool-tagged action payloads, device attestation, and the on-chip fee computation
 - **Target-agnostic protocol dispatcher** (`hwp_dispatcher.h`) — the full device-side state machine (drain → parse → switch → reply, PING/PONG keepalive, IDLE detection, multi-frame drain handling, per-output review, recipient binding, fee review) lives in the library and is exposed through a callback-based API. A new device target wires up ~6 I/O + UI callbacks and gets the protocol implementation for free. The Rust SDK ↔ libzcash protocol contract is therefore mirrored on both sides by one canonical implementation each, not re-derived per device target.
 - **Orchard note-encryption recomputation** — `orchard_compute_enc_ciphertext{,_from_rseed}` rebuilds the 580-byte AEAD ciphertext on-chip for memo verification (Pallas ECDH + `BLAKE2b("Zcash_OrchardKDF", ...)` + ChaCha20-Poly1305)
 - **Crypto primitives**: BLAKE2b, SHA-256/512, HMAC, PBKDF2 (with optional progress callback for PIN unlock UI), AES-256 (FF1), ChaCha20-Poly1305 (RFC 7539, KAT-verified)

@@ -22,6 +22,46 @@ use tracing::{debug, info};
 use zcash_protocol::consensus::{BranchId, OrchardProtocolRevision};
 use zeroize::Zeroize;
 
+/// Pre-proof v6-only gate (post-NU6.3 host).
+///
+/// Rejects any transaction whose consensus branch ID predates NU6.3
+/// (`0x37a5165b`) or whose version header is not v6 (`0x80000006`), before
+/// any expensive Halo2 work. Mirrors the strict device, which enforces the
+/// same constants at `feed_meta` time — failing here saves a device
+/// round-trip that would end in `Error(BAD_META)`.
+///
+/// `coin_type` is only used to populate the [`HwSignerError::NetworkMismatch`]
+/// error for branch IDs that are not valid consensus branches at all.
+pub(crate) fn ensure_v6_only(
+    tx_version_header: u32,
+    consensus_branch_id: u32,
+    coin_type: u32,
+) -> Result<()> {
+    let branch_id = BranchId::try_from(consensus_branch_id).map_err(|_| {
+        HwSignerError::NetworkMismatch {
+            expected: coin_type,
+            got: consensus_branch_id,
+        }
+    })?;
+    let orchard_revision = branch_id.orchard_protocol_revision().ok_or({
+        HwSignerError::NetworkMismatch {
+            expected: coin_type,
+            got: consensus_branch_id,
+        }
+    })?;
+    if orchard_revision < OrchardProtocolRevision::V3 {
+        return Err(HwSignerError::UnsupportedPool(
+            "pre-NU6.3 consensus branch ID: this v6-only host signs NU6.3+ transactions exclusively",
+        ));
+    }
+    if tx_version_header != crate::types::V6_TX_VERSION {
+        return Err(HwSignerError::UnsupportedPool(
+            "transaction version is not v6: this v6-only host emits only the NU6.3 wire tier",
+        ));
+    }
+    Ok(())
+}
+
 /// High-level PCZT hardware signing workflow.
 ///
 /// Takes a PCZT that has been created from a proposal (using the full viewing
@@ -193,75 +233,45 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             }
         };
 
-        // Validate consensus_branch_id is Orchard-protocol-capable (Nu5+)
-        // BEFORE expensive proof generation. The Orchard protocol revision
-        // also selects the Halo2 circuit version(s) used by the prover below.
-        let branch_id = BranchId::try_from(tx_meta.consensus_branch_id).map_err(|_| {
-            HwSignerError::NetworkMismatch {
-                expected: self.signer.coin_type(),
-                got: tx_meta.consensus_branch_id,
-            }
-        })?;
-        let orchard_revision = branch_id.orchard_protocol_revision().ok_or({
-            HwSignerError::NetworkMismatch {
-                expected: self.signer.coin_type(),
-                got: tx_meta.consensus_branch_id,
-            }
-        })?;
-        // The Ironwood pool (v6 transactions) only exists from NU6.3 onward.
-        if tx_meta.is_v6() && orchard_revision < OrchardProtocolRevision::V3 {
-            return Err(HwSignerError::UnsupportedPool(
-                "v6 transaction with a pre-NU6.3 consensus branch ID",
-            ));
-        }
+        // Validate the transaction is post-NU6.3 v6 BEFORE expensive proof
+        // generation. This host is v6-only: any pre-NU6.3 consensus branch
+        // ID or non-v6 transaction version is rejected outright — the
+        // legacy v5 code path no longer exists.
+        ensure_v6_only(
+            tx_meta.version,
+            tx_meta.consensus_branch_id,
+            self.signer.coin_type(),
+        )?;
 
         info!("PCZT parsed (v{}, branch_id=0x{:08x}, {:?}, lock_time={}).",
               tx_meta.version, tx_meta.consensus_branch_id, tx_meta.coin_type, tx_meta.lock_time);
 
         info!("Running Orchard-protocol prover...");
 
-        // Step 2: Generate the Halo2 proof(s). The circuit version follows
-        // the Orchard protocol revision in force under the tx's consensus
-        // branch: pre-NU6.2 bundles use the historical circuit, NU6.2 the
-        // fixed circuit, and NU6.3 (both the sealed Orchard pool and the
-        // Ironwood pool) the circuit that enforces the cross-address
-        // restriction public input.
+        // Step 2: Generate the Halo2 proof(s). v6-only: NU6.3 is guaranteed
+        // by the check above, so both the sealed Orchard pool and the
+        // Ironwood pool use the post-NU6.3 circuit (the one that enforces
+        // the cross-address restriction public input) — one proving key
+        // serves both bundles.
         use orchard::circuit::OrchardCircuitVersion;
-        let orchard_circuit_version = match orchard_revision {
-            OrchardProtocolRevision::InsecureV1 => OrchardCircuitVersion::InsecurePreNu6_2,
-            OrchardProtocolRevision::V2 => OrchardCircuitVersion::FixedPostNu6_2,
-            _ => OrchardCircuitVersion::PostNu6_3,
-        };
 
         let pczt_for_prover = pczt::Pczt::parse(&pczt_bytes)
             .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse: {:?}", e)))?;
         let mut prover = pczt::roles::prover::Prover::new(pczt_for_prover);
         let need_orchard_proof = prover.requires_orchard_proof();
         let need_ironwood_proof = prover.requires_ironwood_proof();
-        let mut ironwood_proven = false;
-        if need_orchard_proof {
-            let orchard_pk = orchard::circuit::ProvingKey::build(orchard_circuit_version);
-            prover = prover
-                .create_orchard_proof(&orchard_pk)
-                .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
-            // Key building is expensive; when the sealed-Orchard bundle already
-            // uses the post-NU6.3 circuit (migration transactions), reuse its
-            // proving key for the Ironwood bundle.
-            if need_ironwood_proof
-                && matches!(orchard_circuit_version, OrchardCircuitVersion::PostNu6_3)
-            {
+        if need_orchard_proof || need_ironwood_proof {
+            let pk = orchard::circuit::ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
+            if need_orchard_proof {
                 prover = prover
-                    .create_ironwood_proof(&orchard_pk)
+                    .create_orchard_proof(&pk)
                     .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
-                ironwood_proven = true;
             }
-        }
-        if need_ironwood_proof && !ironwood_proven {
-            let ironwood_pk =
-                orchard::circuit::ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
-            prover = prover
-                .create_ironwood_proof(&ironwood_pk)
-                .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
+            if need_ironwood_proof {
+                prover = prover
+                    .create_ironwood_proof(&pk)
+                    .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
+            }
         }
         let proven_pczt = prover.finish();
 

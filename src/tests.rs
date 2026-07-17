@@ -420,20 +420,21 @@ mod ironwood_wire_tests {
     }
 
     #[test]
-    fn tx_meta_v5_layout_is_129_bytes_without_ironwood_section() {
+    fn tx_meta_always_serializes_the_170_byte_v6_layout() {
+        // v6-only host: even a meta carrying a legacy version header is
+        // emitted in the 170-byte v6 layout — the 129-byte v5 wire
+        // serialization no longer exists (the workflow rejects non-v6
+        // transactions before any TxMeta ever reaches the wire).
         let meta = sample_meta(0x8000_0005);
-        assert!(!meta.is_v6());
         let bytes = meta.serialize();
-        assert_eq!(bytes.len(), 129);
-        // transparent_sig_digest directly after the Orchard anchor
-        assert_eq!(&bytes[61..93], &[0xC3; 32]);
-        assert_eq!(&bytes[125..129], &133u32.to_le_bytes());
+        assert_eq!(bytes.len(), 170);
+        // Ironwood section present at offset 61 (not transparent_sig_digest)
+        assert_eq!(bytes[61], 0x07);
     }
 
     #[test]
     fn tx_meta_v6_layout_is_170_bytes_with_ironwood_section() {
         let meta = sample_meta(0x8000_0006);
-        assert!(meta.is_v6());
         let bytes = meta.serialize();
         assert_eq!(bytes.len(), 170);
         // Ironwood section: flags[1] || value_balance[8] || anchor[32] at 61
@@ -470,7 +471,64 @@ mod ironwood_wire_tests {
 
         let b = sample_action(ShieldedPoolKind::Orchard, None);
         let bytes = b.serialize_v6();
-        assert_eq!(bytes.len(), 904); // pool(1) + v4(903), cmx-only
+        assert_eq!(bytes.len(), 904); // pool(1) + body(903), cmx-only
         assert_eq!(bytes[0], 0x00);
+    }
+}
+
+// ── v6-only workflow gate tests (post-NU6.3 host) ────────────────────────
+
+mod v6_only_gate_tests {
+    use crate::error::HwSignerError;
+    use crate::types::V6_TX_VERSION;
+    use crate::workflow::ensure_v6_only;
+
+    const NU5: u32 = 0xc2d6_d0b4;
+    const NU6: u32 = 0xc8e7_1055;
+    const NU6_1: u32 = 0x4dec_4df0;
+    const NU6_2: u32 = 0x5437_f330;
+    const NU6_3: u32 = 0x37a5_165b;
+
+    #[test]
+    fn nu6_3_v6_transaction_is_accepted() {
+        assert!(ensure_v6_only(V6_TX_VERSION, NU6_3, 133).is_ok());
+    }
+
+    #[test]
+    fn pre_nu6_3_branch_ids_are_rejected() {
+        for branch in [NU5, NU6, NU6_1, NU6_2] {
+            let err = ensure_v6_only(V6_TX_VERSION, branch, 133).unwrap_err();
+            assert!(
+                matches!(err, HwSignerError::UnsupportedPool(_)),
+                "branch 0x{:08x} must be rejected as UnsupportedPool, got {:?}",
+                branch,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn non_v6_tx_version_is_rejected_even_on_nu6_3() {
+        // A v5 transaction under the NU6.3 branch: valid on-chain during
+        // the transition window, but this v6-only host refuses to sign it.
+        let err = ensure_v6_only(0x8000_0005, NU6_3, 133).unwrap_err();
+        assert!(matches!(err, HwSignerError::UnsupportedPool(_)));
+    }
+
+    #[test]
+    fn unknown_branch_id_is_a_network_mismatch() {
+        let err = ensure_v6_only(V6_TX_VERSION, 0xdead_beef, 133).unwrap_err();
+        assert!(matches!(
+            err,
+            HwSignerError::NetworkMismatch { expected: 133, got: 0xdead_beef }
+        ));
+    }
+
+    #[test]
+    fn pre_orchard_branch_id_is_rejected() {
+        // Canopy predates the Orchard protocol entirely — surfaces as a
+        // NetworkMismatch (no Orchard protocol revision), same as before.
+        let err = ensure_v6_only(V6_TX_VERSION, 0xe9ff_75a6, 133).unwrap_err();
+        assert!(matches!(err, HwSignerError::NetworkMismatch { .. }));
     }
 }

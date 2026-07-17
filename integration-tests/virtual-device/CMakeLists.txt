@@ -27,6 +27,8 @@ add_executable(virtual-device
     wallet_test.c
 )
 
+# libzcash-ironwood-c >= d2af85a renamed the CMake target from
+# zcash-orchard-c to zcash-ironwood-c.
 target_link_libraries(virtual-device PRIVATE zcash-ironwood-c)
 
 target_include_directories(virtual-device PRIVATE

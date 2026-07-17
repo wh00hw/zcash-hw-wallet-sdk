@@ -1,4 +1,8 @@
-//! Integration tests — validate SDK against the virtual device (libzcash-orchard-c).
+//! Integration tests — validate SDK against the virtual device (libzcash-ironwood-c).
+//!
+//! v6-only (post-NU6.3): the strict device accepts only the 166/170-byte
+//! v6 TxMeta and pool-tagged 904/1416-byte action payloads; every fixture
+//! here is built on the NU6.3 wire tier and the ZIP-244 five-leaf sighash.
 //!
 //! Requires the virtual device running on TCP (default: 127.0.0.1:9999).
 //! Set VIRTUAL_DEVICE_ADDR to override.
@@ -18,7 +22,7 @@ use zcash_hw_wallet_sdk::types::{
 };
 
 /// Expected FVK components for coin_type=133 (mainnet), "abandon...about" mnemonic.
-/// From libzcash-orchard-c/tests/test_vectors.h
+/// From libzcash-ironwood-c/tests/test_vectors.h
 const EXPECTED_AK: [u8; 32] = [
     0x4c, 0x9c, 0x06, 0x6f, 0x08, 0x1a, 0x62, 0xec, 0xeb, 0x7b, 0xf8, 0x19, 0x5e, 0x44, 0x23,
     0x52, 0xfa, 0xb1, 0xfd, 0xbe, 0x57, 0x74, 0xb3, 0xfc, 0xe5, 0xee, 0x63, 0x57, 0xe2, 0x01,
@@ -55,19 +59,24 @@ fn connect_codec() -> HwpCodec<TcpTransport> {
     codec
 }
 
-/// Build a synthetic TxMeta for testing.
+/// Build a synthetic v6 (NU6.3 / Ironwood) TxMeta for testing.
+///
+/// The strict v6-only device enforces the NU6.3 header constants at
+/// feed_meta time: version 0x80000006, version_group_id 0xD884B698,
+/// orchard_flags with bit 2 clear, ironwood_flags within bits 0..2.
 fn build_test_tx_meta(coin_type: u32) -> TxMeta {
     TxMeta {
-        version: 5,
-        version_group_id: 0x26A7270A,
-        consensus_branch_id: 0xc2d6d0b4, // Nu5
+        version: 0x8000_0006,
+        version_group_id: 0xD884B698,
+        consensus_branch_id: 0x37a5165b, // NU6.3
         lock_time: 0,
         expiry_height: 0,
-        orchard_flags: 0x03, // spends + outputs enabled
+        orchard_flags: 0x03, // spends + outputs enabled (no cross-address)
         value_balance: 0,
         anchor: [0xAA; 32],
-        // Ironwood section: unused for v5 fixtures (only serialized in the
-        // 170-byte v6 TxMeta layout).
+        // Ironwood bundle: empty in these fixtures (actions ride in the
+        // sealed Orchard pool) — the Ironwood leaf of the five-leaf sighash
+        // is then the empty-bundle constant.
         ironwood_flags: 0,
         ironwood_value_balance: 0,
         ironwood_anchor: [0u8; 32],
@@ -118,7 +127,8 @@ const NOTE_COMMIT_EXPECTED_CMX: [u8; 32] = [
 const NOTE_COMMIT_UA_MAINNET: &str =
     "u1ut4h93zg5670tyqss7tneru3t7h6dk62r9hhyxyrpv3nwwe9dnyj5l0ruwygf74gp5f3zklj5xly4h8h54un3asugt9mn6gwfqsq3wq7";
 
-/// Build a v4 ActionData (903 bytes on the wire) with a KAT-valid cmx.
+/// Build an Orchard-pool ActionData (pool-tagged 904 bytes on the wire)
+/// with a KAT-valid cmx.
 ///
 /// `nullifier`, `recipient`, `value` and `rseed` are wired to the
 /// known-good Sinsemilla input; the device's `feed_action_with_note()`
@@ -127,11 +137,11 @@ const NOTE_COMMIT_UA_MAINNET: &str =
 /// filler — they ride through the ZIP-244 hash unverified, which is
 /// what these tests are exercising.
 ///
-/// `memo` is left `None` so `DeviceSigner` sends the 903-byte cmx-only
-/// payload. Memo verification on the device requires a recomputable
-/// `enc_ciphertext`, which the filler bytes above don't satisfy — the
-/// memo-verifying path is exercised in the libzcash-ironwood-c signer
-/// tests instead.
+/// `memo` is left `None` so `serialize_v6()` emits the pool-tagged
+/// 904-byte cmx-only payload. Memo verification on the device requires a
+/// recomputable `enc_ciphertext`, which the filler bytes above don't
+/// satisfy — the memo-verifying path (1416 B) is exercised in the
+/// libzcash-ironwood-c signer tests instead.
 fn build_test_action_data() -> ActionData {
     ActionData {
         pool: zcash_hw_wallet_sdk::types::ShieldedPoolKind::Orchard,
@@ -160,8 +170,11 @@ fn blake2b_personal(personal: &[u8; 16], data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Compute the ZIP-244 sighash from TxMeta + actions (Rust-side).
-/// Must produce the same result as the C library's zip244_shielded_sighash().
+/// Compute the ZIP-244 v6 (NU6.3 / Ironwood) five-leaf shielded sighash
+/// from TxMeta + Orchard-pool actions (Rust-side).
+/// Must produce the same result as the C library's
+/// zip244_shielded_sighash_v6(). These fixtures carry all actions in the
+/// sealed Orchard pool; the Ironwood leaf is the empty-bundle constant.
 fn compute_zip244_sighash(meta: &TxMeta, actions: &[ActionData]) -> [u8; 32] {
     // 1. Header digest
     let mut hdr_data = Vec::new();
@@ -176,7 +189,9 @@ fn compute_zip244_sighash(meta: &TxMeta, actions: &[ActionData]) -> [u8; 32] {
     let transparent_digest = meta.transparent_sig_digest;
     let sapling_digest = meta.sapling_digest;
 
-    // 3. Orchard digest — three parallel sub-hashes
+    // 3. Orchard (sealed pool) digest — three parallel sub-hashes. The
+    //    action-level personalizations are unchanged from v5; domain
+    //    separation happens at the bundle level ("ZTxIdOrchardH_v6").
     let mut compact = blake2b_simd::Params::new()
         .hash_length(32)
         .personal(b"ZTxIdOrcActCHash")
@@ -211,19 +226,23 @@ fn compute_zip244_sighash(meta: &TxMeta, actions: &[ActionData]) -> [u8; 32] {
     let memos_digest: [u8; 32] = memos.finalize().as_bytes().try_into().unwrap();
     let noncompact_digest: [u8; 32] = noncompact.finalize().as_bytes().try_into().unwrap();
 
-    // orchard_digest = BLAKE2b("ZTxIdOrchardHash",
-    //     compact || memos || noncompact || flags[1] || value_balance[8] || anchor[32])
+    // orchard_digest = BLAKE2b("ZTxIdOrchardH_v6",
+    //     compact || memos || noncompact || flags[1] || value_balance[8])
+    // Under v6 the anchor is NOT part of the bundle effects digest (it
+    // moves to the authorizing-data commitment).
     let mut orchard_input = Vec::new();
     orchard_input.extend_from_slice(&compact_digest);
     orchard_input.extend_from_slice(&memos_digest);
     orchard_input.extend_from_slice(&noncompact_digest);
     orchard_input.push(meta.orchard_flags);
     orchard_input.extend_from_slice(&meta.value_balance.to_le_bytes());
-    orchard_input.extend_from_slice(&meta.anchor);
-    let orchard_digest = blake2b_personal(b"ZTxIdOrchardHash", &orchard_input);
+    let orchard_digest = blake2b_personal(b"ZTxIdOrchardH_v6", &orchard_input);
 
-    // 4. Root sighash = BLAKE2b("ZcashTxHash_" || branch_id[4 LE],
-    //        header || transparent || sapling || orchard)
+    // 4. Ironwood digest — empty bundle in these fixtures.
+    let ironwood_digest = blake2b_personal(b"ZTxIdIronwd_H_v6", &[]);
+
+    // 5. Root sighash = BLAKE2b("ZcashTxHash_" || branch_id[4 LE],
+    //        header || transparent || sapling || orchard || ironwood)
     let mut root_personal = [0u8; 16];
     root_personal[..12].copy_from_slice(b"ZcashTxHash_");
     root_personal[12..].copy_from_slice(&meta.consensus_branch_id.to_le_bytes());
@@ -233,6 +252,7 @@ fn compute_zip244_sighash(meta: &TxMeta, actions: &[ActionData]) -> [u8; 32] {
     root_input.extend_from_slice(&transparent_digest);
     root_input.extend_from_slice(&sapling_digest);
     root_input.extend_from_slice(&orchard_digest);
+    root_input.extend_from_slice(&ironwood_digest);
 
     blake2b_personal(&root_personal, &root_input)
 }
@@ -320,7 +340,7 @@ fn test_sighash_valid() {
         .expect("TxMeta send failed");
 
     // Send action (index=0)
-    let action_bytes = action.serialize();
+    let action_bytes = action.serialize_v6();
     codec
         .send_tx_output(0, 1, &action_bytes)
         .expect("Action send failed");
@@ -344,7 +364,7 @@ fn test_sighash_mismatch() {
         .send_tx_output(0xFFFF, 1, &meta_bytes)
         .expect("TxMeta send failed");
 
-    let action_bytes = action.serialize();
+    let action_bytes = action.serialize_v6();
     codec
         .send_tx_output(0, 1, &action_bytes)
         .expect("Action send failed");
@@ -385,7 +405,7 @@ fn test_sighash_multi_action() {
 
     for (i, action) in actions.iter().enumerate() {
         codec
-            .send_tx_output(i as u16, 3, &action.serialize())
+            .send_tx_output(i as u16, 3, &action.serialize_v6())
             .expect(&format!("Action {} failed", i));
     }
 
@@ -414,7 +434,7 @@ fn test_full_sign_flow() {
         .send_tx_output(0xFFFF, 1, &meta_bytes)
         .expect("TxMeta failed");
     codec
-        .send_tx_output(0, 1, &action.serialize())
+        .send_tx_output(0, 1, &action.serialize_v6())
         .expect("Action failed");
     codec
         .send_tx_output(1, 1, &sighash)
@@ -543,7 +563,7 @@ fn test_abort_resets_session() {
         .send_tx_output(0xFFFF, 1, &meta_bytes)
         .expect("TxMeta after abort should work");
     codec
-        .send_tx_output(0, 1, &action.serialize())
+        .send_tx_output(0, 1, &action.serialize_v6())
         .expect("Action after abort should work");
     codec
         .send_tx_output(1, 1, &sighash)
@@ -557,10 +577,66 @@ fn test_invalid_state_action_without_metadata() {
 
     // Send action data without prior metadata — should fail
     let action = build_test_action_data();
-    let result = codec.send_tx_output(0, 1, &action.serialize());
+    let result = codec.send_tx_output(0, 1, &action.serialize_v6());
     assert!(
         result.is_err(),
         "Action without metadata should be rejected"
+    );
+}
+
+// ── Group 6b: v6-only strict-tier enforcement ────────────────────────
+
+/// The strict post-NU6.3 device rejects the legacy 129-byte v5 TxMeta
+/// layout outright (Error/BAD_META — the parse accepts only 166/170 B).
+/// The SDK can no longer produce this layout; hand-craft it the way a
+/// legacy host would have.
+#[test]
+fn test_legacy_v5_tx_meta_rejected() {
+    let mut codec = connect_codec();
+    codec.request_fvk(COIN_TYPE_MAINNET).expect("FVK failed");
+
+    // 129-byte v5 layout = v6 layout minus the 41-byte Ironwood section.
+    let meta = build_test_tx_meta(COIN_TYPE_MAINNET);
+    let v6_bytes = meta.serialize();
+    assert_eq!(v6_bytes.len(), 170);
+    let mut v5_bytes = Vec::with_capacity(129);
+    v5_bytes.extend_from_slice(&v6_bytes[..61]); // header + Orchard section
+    v5_bytes.extend_from_slice(&v6_bytes[102..]); // digests + coin_type
+    assert_eq!(v5_bytes.len(), 129);
+    // Legacy v5 header constants, as a pre-NU6.3 host would send them.
+    v5_bytes[..4].copy_from_slice(&0x8000_0005u32.to_le_bytes());
+    v5_bytes[4..8].copy_from_slice(&0x26A7270Au32.to_le_bytes());
+    v5_bytes[8..12].copy_from_slice(&0xc2d6d0b4u32.to_le_bytes()); // Nu5
+
+    let result = codec.send_tx_output(0xFFFF, 1, &v5_bytes);
+    assert!(
+        result.is_err(),
+        "129-byte v5 TxMeta must be rejected by the strict v6-only device"
+    );
+}
+
+/// Untagged (legacy v4/v5) 903-byte action payloads are rejected after a
+/// valid v6 meta — the pool tag is mandatory on this tier.
+#[test]
+fn test_untagged_legacy_action_rejected() {
+    let mut codec = connect_codec();
+    codec.request_fvk(COIN_TYPE_MAINNET).expect("FVK failed");
+
+    let meta = build_test_tx_meta(COIN_TYPE_MAINNET);
+    codec
+        .send_tx_output(0xFFFF, 1, &meta.serialize())
+        .expect("v6 TxMeta send failed");
+
+    // Strip the pool tag → the untagged 903-byte legacy body.
+    let action = build_test_action_data();
+    let tagged = action.serialize_v6();
+    assert_eq!(tagged.len(), 904);
+    let untagged = &tagged[1..];
+
+    let result = codec.send_tx_output(0, 1, untagged);
+    assert!(
+        result.is_err(),
+        "untagged 903-byte action must be rejected by the strict v6-only device"
     );
 }
 
@@ -792,7 +868,7 @@ fn test_transparent_digest_then_orchard_sighash() {
 
     // 3. Orchard action data
     codec
-        .send_tx_output(0, 1, &action.serialize())
+        .send_tx_output(0, 1, &action.serialize_v6())
         .expect("Action send failed");
 
     // 4. Sighash sentinel
