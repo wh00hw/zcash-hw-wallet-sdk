@@ -3,9 +3,9 @@ name = "zcash-hw-wallet-sdk"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Transport-agnostic SDK for signing Zcash Orchard shielded transactions via hardware wallets using the PCZT standard"
+description = "Transport-agnostic SDK for signing Zcash shielded (Ironwood + sealed-Orchard turnstile) transactions via hardware wallets using the PCZT standard"
 repository = "https://github.com/wh00hw/zcash-hw-wallet-sdk"
-keywords = ["zcash", "hardware-wallet", "pczt", "orchard", "signing"]
+keywords = ["zcash", "hardware-wallet", "pczt", "orchard", "ironwood"]
 categories = ["cryptography", "hardware-support"]
 
 [features]

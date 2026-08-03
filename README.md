@@ -15,7 +15,7 @@
 >
 > If you are interested in sponsoring or conducting an audit, please open an issue.
 
-Transport-agnostic Rust SDK for signing Zcash Orchard shielded + Transparent transactions via hardware wallets using the [PCZT](https://zips.z.cash/zip-0320) (Partially Created Zcash Transaction) standard.
+Transport-agnostic Rust SDK for signing Zcash shielded + Transparent transactions via hardware wallets using the [PCZT](https://zips.z.cash/zip-0320) (Partially Created Zcash Transaction) standard. Post-NU6.3 that means the **Ironwood pool** (ZIP 258) plus turnstile withdrawals from the sealed Orchard pool; both are built on the Orchard protocol family, whose name survives in the underlying crates and primitives.
 
 ## The Problem
 

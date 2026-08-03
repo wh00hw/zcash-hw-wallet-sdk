@@ -27,7 +27,7 @@ add_executable(virtual-device
     wallet_test.c
 )
 
-target_link_libraries(virtual-device PRIVATE zcash-orchard-c)
+target_link_libraries(virtual-device PRIVATE zcash-ironwood-c)
 
 target_include_directories(virtual-device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

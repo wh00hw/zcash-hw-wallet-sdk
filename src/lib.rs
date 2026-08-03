@@ -1,6 +1,7 @@
 //! # zcash-hw-wallet-sdk
 //!
-//! Transport-agnostic SDK for signing Zcash Orchard shielded transactions
+//! Transport-agnostic SDK for signing Zcash shielded transactions —
+//! the Ironwood pool (NU6.3) plus sealed-Orchard turnstile withdrawals —
 //! via hardware wallets using the PCZT (Partially Created Zcash Transaction)
 //! standard.
 //!
