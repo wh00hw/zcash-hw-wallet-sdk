@@ -47,8 +47,8 @@ ripemd = "0.1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Zcash crates — aligned with librustzcash main (NU6.3 / Ironwood pre-release stack)
-pczt = { version = "0.8.0-rc.1", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
-orchard = "0.15.0"
+pczt = { version = "0.9.1", features = ["io-finalizer", "prover", "signer", "spend-finalizer", "tx-extractor"] }
+orchard = "0.15.5"
 reddsa = "0.5"
 ff = "0.13"
 # Used in workflow.rs to trial-decrypt out_ciphertext / enc_ciphertext with
@@ -57,8 +57,8 @@ ff = "0.13"
 zcash_note_encryption = "0.4"
 secp256k1 = "0.29"
 zcash_address = "0.13.0"
-zcash_primitives = "0.29.0"
-zcash_protocol = "0.10.0"
+zcash_primitives = "0.30.0"
+zcash_protocol = "0.10.3"
 
 # Serial transport (optional)
 serialport = { version = "4", optional = true }
