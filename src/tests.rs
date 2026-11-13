@@ -227,13 +227,24 @@ fn test_msg_type_roundtrip() {
 
 #[test]
 fn test_error_code_roundtrip() {
-    /* Range extended to 0x13 to cover the v5 device-side codes
-     * (MemoMismatch=0x0F .. FeeNegative=0x13). */
-    for v in 0x01..=0x13u8 {
+    /* Range extended to 0x17: the v5 device-side codes
+     * (MemoMismatch=0x0F .. FeeNegative=0x13) and the November 2026 ones
+     * (MemoRequired=0x14, BranchNotAllowed=0x15, LimitExceeded=0x16,
+     * ValueOverflow=0x17). */
+    for v in 0x01..=0x19u8 {
         let ec = protocol::ErrorCode::from_u8(v);
         assert_eq!(ec as u8, v);
     }
-    assert_eq!(protocol::ErrorCode::from_u8(0x14), protocol::ErrorCode::Unknown);
+    assert_eq!(protocol::ErrorCode::from_u8(0x14), protocol::ErrorCode::MemoRequired);
+    assert_eq!(protocol::ErrorCode::from_u8(0x15), protocol::ErrorCode::BranchNotAllowed);
+    assert_eq!(protocol::ErrorCode::from_u8(0x16), protocol::ErrorCode::LimitExceeded);
+    assert_eq!(protocol::ErrorCode::from_u8(0x17), protocol::ErrorCode::ValueOverflow);
+    assert_eq!(
+        protocol::ErrorCode::from_u8(0x18),
+        protocol::ErrorCode::TransparentInputsUnsupported
+    );
+    assert_eq!(protocol::ErrorCode::from_u8(0x19), protocol::ErrorCode::EmptyPoolBalance);
+    assert_eq!(protocol::ErrorCode::from_u8(0x1A), protocol::ErrorCode::Unknown);
     assert_eq!(protocol::ErrorCode::from_u8(0xFF), protocol::ErrorCode::Unknown);
 }
 
@@ -327,6 +338,78 @@ fn test_codec_crc_mismatch_detected() {
 
     let err = codec.read_frame().unwrap_err();
     assert!(matches!(err, HwSignerError::CrcMismatch { .. }));
+}
+
+/// The device's Error frames for the November 2026 rules surface as their
+/// own typed errors (with the device's message), on every request path that
+/// can receive them.
+#[test]
+fn test_codec_new_device_errors_are_typed() {
+    fn error_frame(code: u8, msg: &str) -> Vec<u8> {
+        let mut payload = vec![code];
+        payload.extend_from_slice(msg.as_bytes());
+        protocol::hwp::encode_frame(0, MsgType::Error, &payload)
+    }
+    fn tx_output_err(code: u8, msg: &str) -> HwSignerError {
+        let mut codec = HwpCodec::new(MockTransport::from_bytes(error_frame(code, msg)));
+        codec.send_tx_output(0, 1, &[0u8; 904]).unwrap_err()
+    }
+
+    match tx_output_err(0x14, "Output with value needs the memo-carrying body") {
+        HwSignerError::MemoRequired { reason } => {
+            assert_eq!(reason, "Output with value needs the memo-carrying body")
+        }
+        e => panic!("0x14 mapped to {:?}", e),
+    }
+    assert!(matches!(
+        tx_output_err(0x15, "Consensus branch not supported by this firmware"),
+        HwSignerError::BranchNotAllowed { .. }
+    ));
+    assert!(matches!(
+        tx_output_err(0x16, "More outputs than the device can review"),
+        HwSignerError::DeviceLimitExceeded { .. }
+    ));
+    assert!(matches!(
+        tx_output_err(0x17, "Output values overflow"),
+        HwSignerError::ValueOverflow { .. }
+    ));
+    assert!(matches!(
+        tx_output_err(0x18, "Transparent inputs are not supported"),
+        HwSignerError::TransparentInputsNotSupported { inputs: 0 }
+    ));
+    assert!(matches!(
+        tx_output_err(0x19, "Value balance for a pool without actions"),
+        HwSignerError::EmptyPoolBalance { .. }
+    ));
+    // No message text: still typed, with a placeholder reason.
+    match tx_output_err(0x14, "") {
+        HwSignerError::MemoRequired { reason } => assert!(!reason.is_empty()),
+        e => panic!("0x14 mapped to {:?}", e),
+    }
+    // A code this SDK does not know keeps the device's text.
+    match tx_output_err(0x7E, "something new") {
+        HwSignerError::DeviceError(s) => assert!(s.contains("something new"), "{}", s),
+        e => panic!("unknown code mapped to {:?}", e),
+    }
+
+    // SIGN_REQ path (value overflow can be reported there too).
+    let mut codec = HwpCodec::new(MockTransport::from_bytes(error_frame(0x17, "Output values overflow")));
+    let err = codec
+        .sign(&SignRequest {
+            sighash: [0; 32],
+            alpha: [0; 32],
+            amount: 0,
+            fee: 0,
+            recipient: String::new(),
+            action_index: 0,
+            total_actions: 1,
+        })
+        .unwrap_err();
+    assert!(matches!(err, HwSignerError::ValueOverflow { .. }), "{:?}", err);
+
+    // The messages name the rule, not just the code.
+    let text = tx_output_err(0x14, "x").to_string();
+    assert!(text.contains("memo-carrying") && text.contains("every output"), "{}", text);
 }
 
 // ── HardwareSigner trait tests ───────────────────────────────────────────
@@ -476,22 +559,88 @@ mod ironwood_wire_tests {
     }
 }
 
-// ── v6-only workflow gate tests (post-NU6.3 host) ────────────────────────
+// ── v6-only workflow gate tests (NU6.3 / NU7 host) ───────────────────────
 
 mod v6_only_gate_tests {
     use crate::error::HwSignerError;
     use crate::types::V6_TX_VERSION;
-    use crate::workflow::ensure_v6_only;
+    use crate::workflow::{check_branch, ensure_v6_globals, ensure_v6_only, SUPPORTED_BRANCH_IDS};
+    use zcash_protocol::consensus::BranchId;
 
     const NU5: u32 = 0xc2d6_d0b4;
     const NU6: u32 = 0xc8e7_1055;
     const NU6_1: u32 = 0x4dec_4df0;
     const NU6_2: u32 = 0x5437_f330;
     const NU6_3: u32 = 0x37a5_165b;
+    const NU7: u32 = 0x7719_0ad9;
 
     #[test]
     fn nu6_3_v6_transaction_is_accepted() {
         assert!(ensure_v6_only(V6_TX_VERSION, NU6_3, 133).is_ok());
+    }
+
+    #[test]
+    fn nu7_v6_transaction_is_accepted() {
+        // NU7 (active on testnet from 4,465,026 and on mainnet from
+        // 3,543,405) keeps the v6 transaction format, on both networks.
+        assert!(ensure_v6_only(V6_TX_VERSION, NU7, 133).is_ok());
+        assert!(ensure_v6_only(V6_TX_VERSION, NU7, 1).is_ok());
+    }
+
+    #[test]
+    fn supported_branch_ids_are_exactly_nu6_3_and_nu7() {
+        // The literals above are what goes on the wire; pin them to the
+        // zcash_protocol constants so a crate bump cannot silently move
+        // either one (NU7 was the placeholder 0xFFFFFFFF before
+        // zcash_protocol 0.11, and 0x77190AD8 in a retired proposal).
+        assert_eq!(u32::from(BranchId::Nu6_3), NU6_3);
+        assert_eq!(u32::from(BranchId::Nu7), NU7);
+        assert_eq!(SUPPORTED_BRANCH_IDS, [BranchId::Nu6_3, BranchId::Nu7]);
+        for retired in [0x7719_0ad8u32, 0xffff_ffff] {
+            assert!(ensure_v6_only(V6_TX_VERSION, retired, 133).is_err());
+        }
+    }
+
+    #[test]
+    fn allow_list_is_what_admits_a_branch() {
+        // Both NU6.3 and NU7 select Orchard revision V3, so only the
+        // allow-list distinguishes "reviewed" from "merely V3". With NU7
+        // taken off the list it must be refused, and vice versa.
+        assert!(check_branch(NU7, 133, &[BranchId::Nu6_3, BranchId::Nu7]).is_ok());
+        assert!(matches!(
+            check_branch(NU7, 133, &[BranchId::Nu6_3]),
+            Err(HwSignerError::UnsupportedPool(_))
+        ));
+        assert!(matches!(
+            check_branch(NU6_3, 133, &[BranchId::Nu7]),
+            Err(HwSignerError::UnsupportedPool(_))
+        ));
+        assert!(matches!(
+            check_branch(NU7, 133, &[]),
+            Err(HwSignerError::UnsupportedPool(_))
+        ));
+        // Being on the list does not rescue a pre-V3 branch.
+        assert!(matches!(
+            check_branch(NU6_2, 133, &[BranchId::Nu6_2]),
+            Err(HwSignerError::UnsupportedPool(_))
+        ));
+    }
+
+    #[test]
+    fn globals_gate_requires_v6_number_and_group_id() {
+        assert!(ensure_v6_globals(6, 0xD884_B698, NU7, 1).is_ok());
+        assert!(matches!(
+            ensure_v6_globals(5, 0x26A7_270A, NU7, 1),
+            Err(HwSignerError::UnsupportedPool(_))
+        ));
+        assert!(matches!(
+            ensure_v6_globals(6, 0x26A7_270A, NU7, 1),
+            Err(HwSignerError::UnsupportedPool(_))
+        ));
+        assert!(matches!(
+            ensure_v6_globals(6, 0xD884_B698, 0xdead_beef, 1),
+            Err(HwSignerError::NetworkMismatch { expected: 1, got: 0xdead_beef })
+        ));
     }
 
     #[test]
@@ -508,11 +657,14 @@ mod v6_only_gate_tests {
     }
 
     #[test]
-    fn non_v6_tx_version_is_rejected_even_on_nu6_3() {
-        // A v5 transaction under the NU6.3 branch: valid on-chain during
-        // the transition window, but this v6-only host refuses to sign it.
-        let err = ensure_v6_only(0x8000_0005, NU6_3, 133).unwrap_err();
-        assert!(matches!(err, HwSignerError::UnsupportedPool(_)));
+    fn non_v6_tx_version_is_rejected_on_nu6_3_and_nu7() {
+        // A v5 transaction is still valid on-chain under both branches
+        // (ZIP 2003 only retires v4), but this v6-only host refuses to
+        // sign it.
+        for branch in [NU6_3, NU7] {
+            let err = ensure_v6_only(0x8000_0005, branch, 133).unwrap_err();
+            assert!(matches!(err, HwSignerError::UnsupportedPool(_)));
+        }
     }
 
     #[test]
@@ -530,5 +682,509 @@ mod v6_only_gate_tests {
         // NetworkMismatch (no Orchard protocol revision), same as before.
         let err = ensure_v6_only(V6_TX_VERSION, 0xe9ff_75a6, 133).unwrap_err();
         assert!(matches!(err, HwSignerError::NetworkMismatch { .. }));
+    }
+}
+
+// ── NU7 TxMeta derivation (host only) ────────────────────────────────────
+//
+// These run without a device. They pin what the host derives for a v6
+// transaction under the NU7 branch — via the production `TxMeta::from_pczt`
+// — and compare pczt's own shielded sighash with an independent reference
+// implementation of the five-leaf hash written out below. Whether the
+// *device* computes the same thing is checked in tests/integration.rs
+// (`test_nu7_*`), not here.
+
+mod nu7_tx_meta_tests {
+    use crate::types::{TxMeta, V6_TX_VERSION};
+    use zcash_protocol::consensus::BranchId;
+
+    const NU6_3: u32 = 0x37a5_165b;
+    const NU7: u32 = 0x7719_0ad9;
+
+    fn blake2b(personal: &[u8; 16], data: &[u8]) -> [u8; 32] {
+        let h = blake2b_simd::Params::new()
+            .hash_length(32)
+            .personal(personal)
+            .hash(data);
+        h.as_bytes().try_into().unwrap()
+    }
+
+    /// Reference five-leaf ZIP-244 v6 sighash for a transaction with no
+    /// shielded actions and no transparent bundle, computed only from the
+    /// TxMeta fields that go over the wire. Test-local re-implementation.
+    fn reference_empty_tx_sighash(meta: &TxMeta) -> [u8; 32] {
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(&meta.version.to_le_bytes());
+        hdr.extend_from_slice(&meta.version_group_id.to_le_bytes());
+        hdr.extend_from_slice(&meta.consensus_branch_id.to_le_bytes());
+        hdr.extend_from_slice(&meta.lock_time.to_le_bytes());
+        hdr.extend_from_slice(&meta.expiry_height.to_le_bytes());
+
+        let mut root_personal = [0u8; 16];
+        root_personal[..12].copy_from_slice(b"ZcashTxHash_");
+        root_personal[12..].copy_from_slice(&meta.consensus_branch_id.to_le_bytes());
+
+        let mut root = Vec::new();
+        root.extend_from_slice(&blake2b(b"ZTxIdHeadersHash", &hdr));
+        root.extend_from_slice(&meta.transparent_sig_digest);
+        root.extend_from_slice(&meta.sapling_digest);
+        root.extend_from_slice(&blake2b(b"ZTxIdOrchardH_v6", &[]));
+        root.extend_from_slice(&blake2b(b"ZTxIdIronwd_H_v6", &[]));
+        blake2b(&root_personal, &root)
+    }
+
+    fn empty_pczt(branch: BranchId, expiry_height: u32) -> pczt::Pczt {
+        pczt::roles::creator::Creator::new(branch.into(), expiry_height, 1, None, None)
+            .expect("v6 branch")
+            .build()
+            .expect("empty v6 PCZT")
+    }
+
+    #[test]
+    fn from_pczt_derives_the_v6_header_under_nu7() {
+        let pczt = empty_pczt(BranchId::Nu7, 4_600_120);
+        // The PCZT global carries the bare version number...
+        assert_eq!(*pczt.global().tx_version(), 6);
+
+        // ...and the production derivation yields the real header word.
+        let meta = TxMeta::from_pczt(&pczt, 1).expect("derivation");
+        assert_eq!(meta.version, V6_TX_VERSION);
+        assert_eq!(meta.version_group_id, 0xD884_B698);
+        assert_eq!(meta.consensus_branch_id, NU7);
+        assert_eq!(meta.expiry_height, 4_600_120);
+        assert_eq!(meta.coin_type, 1);
+        assert_eq!(meta.transparent_sig_digest, blake2b(b"ZTxIdTranspaHash", &[]));
+        assert_eq!(meta.sapling_digest, blake2b(b"ZTxIdSaplingHash", &[]));
+        // What from_pczt returns passes the production gate.
+        crate::workflow::ensure_v6_only(meta.version, meta.consensus_branch_id, 1).unwrap();
+
+        // Wire layout is unchanged: 170 bytes, branch ID at offset 8.
+        let bytes = meta.serialize();
+        assert_eq!(bytes.len(), 170);
+        assert_eq!(&bytes[0..4], &0x8000_0006u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0xD884_B698u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &NU7.to_le_bytes());
+        assert_eq!(&bytes[16..20], &4_600_120u32.to_le_bytes());
+    }
+
+    #[test]
+    fn pczt_empty_tx_sighash_matches_reference_five_leaf_hash() {
+        for (branch, id) in [(BranchId::Nu6_3, NU6_3), (BranchId::Nu7, NU7)] {
+            let pczt = empty_pczt(branch, 4_600_120);
+            let meta = TxMeta::from_pczt(&pczt, 1).expect("derivation");
+            assert_eq!(meta.consensus_branch_id, id);
+
+            let upstream = pczt::roles::signer::Signer::new(pczt)
+                .expect("signer")
+                .shielded_sighash();
+            assert_eq!(
+                upstream,
+                reference_empty_tx_sighash(&meta),
+                "pczt's v6 sighash diverged from the reference for branch 0x{:08x}",
+                id
+            );
+        }
+    }
+
+    #[test]
+    fn nu7_and_nu6_3_reference_sighashes_differ_only_through_the_branch_id() {
+        let sighash = |branch| {
+            pczt::roles::signer::Signer::new(empty_pczt(branch, 4_600_120))
+                .expect("signer")
+                .shielded_sighash()
+        };
+        assert_ne!(sighash(BranchId::Nu6_3), sighash(BranchId::Nu7));
+
+        let mut meta =
+            TxMeta::from_pczt(&empty_pczt(BranchId::Nu6_3, 4_600_120), 1).expect("derivation");
+        meta.consensus_branch_id = NU7;
+        assert_eq!(reference_empty_tx_sighash(&meta), sighash(BranchId::Nu7));
+    }
+}
+
+// ── Public `sign()` on foreign / malformed / unrecoverable PCZTs ─────────
+//
+// Everything here goes through `PcztHardwareSigning::sign*`, the public
+// entry point, with a signer that counts what reaches the "device".
+
+mod public_sign_rejection_tests {
+    use crate::error::{HwSignerError, Result};
+    use crate::traits::HardwareSigner;
+    use crate::types::{
+        ActionData, ExportedFvk, ShieldedPoolKind, SignRequest, SignResponse,
+        TransparentInputData, TransparentOutputData, TxMeta,
+    };
+    use crate::PcztHardwareSigning;
+    use zcash_protocol::consensus::BranchId;
+
+    /// Records every interaction; never signs.
+    #[derive(Default)]
+    struct RecordingSigner {
+        fvk: Option<ExportedFvk>,
+        fvk_requests: usize,
+        verify_calls: Vec<Vec<ActionData>>,
+        sign_calls: usize,
+    }
+
+    impl HardwareSigner for RecordingSigner {
+        fn coin_type(&self) -> u32 {
+            133
+        }
+        fn export_fvk(&mut self) -> Result<ExportedFvk> {
+            self.fvk_requests += 1;
+            self.fvk
+                .clone()
+                .ok_or_else(|| HwSignerError::DeviceError("no fvk".into()))
+        }
+        fn sign_action(&mut self, _request: &SignRequest) -> Result<SignResponse> {
+            self.sign_calls += 1;
+            Err(HwSignerError::UserCancelled)
+        }
+        fn verify_transaction(
+            &mut self,
+            _meta: &TxMeta,
+            actions: &[ActionData],
+            _sighash: &[u8; 32],
+            _t_in: &[TransparentInputData],
+            _t_out: &[TransparentOutputData],
+        ) -> Result<()> {
+            self.verify_calls.push(actions.to_vec());
+            // Stop the workflow here: these tests are about what the host
+            // sends (or refuses to send), not about signing.
+            Err(HwSignerError::UserCancelled)
+        }
+    }
+
+    fn sign(signer: RecordingSigner, bytes: Vec<u8>) -> (Result<()>, RecordingSigner) {
+        let mut workflow = PcztHardwareSigning::new(signer);
+        let result = workflow.sign(bytes).map(|_| ());
+        (result, workflow.into_signer())
+    }
+
+    fn assert_nothing_reached_the_device(signer: &RecordingSigner) {
+        assert_eq!(signer.fvk_requests, 0);
+        assert!(signer.verify_calls.is_empty());
+        assert_eq!(signer.sign_calls, 0);
+    }
+
+    /// postcard / LEB128 encoding of a u32, as used for the PCZT globals.
+    fn varint(mut v: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return out;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn empty_v6_pczt_bytes(branch: BranchId) -> Vec<u8> {
+        pczt::roles::creator::Creator::new(branch.into(), 4_600_120, 133, None, None)
+            .unwrap()
+            .build()
+            .unwrap()
+            .serialize()
+            .unwrap()
+    }
+
+    /// A serialized v6 PCZT whose consensus branch ID has been overwritten.
+    fn pczt_bytes_with_branch(branch_id: u32) -> Vec<u8> {
+        let mut bytes = empty_v6_pczt_bytes(BranchId::Nu7);
+        let from = varint(0x7719_0ad9);
+        let to = varint(branch_id);
+        assert_eq!(from.len(), to.len(), "pick a branch ID with a same-length varint");
+        let positions: Vec<usize> = bytes
+            .windows(from.len())
+            .enumerate()
+            .filter(|(_, w)| *w == from.as_slice())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 1, "branch ID must occur exactly once");
+        bytes[positions[0]..positions[0] + to.len()].copy_from_slice(&to);
+        assert_eq!(
+            *pczt::Pczt::parse(&bytes).unwrap().global().consensus_branch_id(),
+            branch_id
+        );
+        bytes
+    }
+
+    #[test]
+    fn garbage_bytes_are_an_invalid_pczt_error_not_a_panic() {
+        for bytes in [vec![], vec![0u8; 3], b"PCZT\x01\x00\x00\x00garbage".to_vec()] {
+            let (result, signer) = sign(RecordingSigner::default(), bytes);
+            assert!(matches!(result, Err(HwSignerError::InvalidPczt(_))), "{:?}", result);
+            assert_nothing_reached_the_device(&signer);
+        }
+    }
+
+    #[test]
+    fn unknown_branch_id_is_a_network_mismatch_through_sign() {
+        let (result, signer) =
+            sign(RecordingSigner::default(), pczt_bytes_with_branch(0xdead_beef));
+        assert!(
+            matches!(
+                result,
+                Err(HwSignerError::NetworkMismatch { expected: 133, got: 0xdead_beef })
+            ),
+            "{:?}",
+            result
+        );
+        assert_nothing_reached_the_device(&signer);
+    }
+
+    #[test]
+    fn retired_nu7_branch_id_is_rejected_through_sign() {
+        let (result, signer) =
+            sign(RecordingSigner::default(), pczt_bytes_with_branch(0x7719_0ad8));
+        assert!(matches!(result, Err(HwSignerError::NetworkMismatch { .. })), "{:?}", result);
+        assert_nothing_reached_the_device(&signer);
+    }
+
+    #[test]
+    fn nu5_v5_pczt_is_unsupported_through_sign() {
+        let bytes = pczt::roles::creator::Creator::new(
+            BranchId::Nu5.into(),
+            4_600_120,
+            133,
+            None,
+            Some([0u8; 32]),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .serialize()
+        .unwrap();
+        let (result, signer) = sign(RecordingSigner::default(), bytes);
+        assert!(matches!(result, Err(HwSignerError::UnsupportedPool(_))), "{:?}", result);
+        assert_nothing_reached_the_device(&signer);
+    }
+
+    #[test]
+    fn nu6_2_branch_on_a_v6_pczt_is_unsupported_through_sign() {
+        // NU6.2 is a real branch, but pre-NU6.3: the branch arm fires.
+        let (result, signer) =
+            sign(RecordingSigner::default(), pczt_bytes_with_branch(0x5437_f330));
+        assert!(matches!(result, Err(HwSignerError::UnsupportedPool(_))), "{:?}", result);
+        assert_nothing_reached_the_device(&signer);
+    }
+
+    #[test]
+    fn supported_empty_pczt_gets_past_the_gate() {
+        // Control: the same construction under NU7 / NU6.3 is not refused
+        // by the gate; it ends at "nothing to sign".
+        for branch in [BranchId::Nu6_3, BranchId::Nu7] {
+            let (result, _) = sign(RecordingSigner::default(), empty_v6_pczt_bytes(branch));
+            assert!(matches!(result, Err(HwSignerError::NoActionsToSign)), "{:?}", result);
+        }
+    }
+
+    // ── value-carrying outputs must be recoverable ──────────────────────
+
+    struct Wallet {
+        fvk: orchard::keys::FullViewingKey,
+        exported: ExportedFvk,
+    }
+
+    fn wallet(seed: u8) -> Wallet {
+        let sk = orchard::keys::SpendingKey::from_bytes([seed; 32]).unwrap();
+        let fvk = orchard::keys::FullViewingKey::from(&sk);
+        let b = fvk.to_bytes();
+        let exported = ExportedFvk {
+            ak: b[..32].try_into().unwrap(),
+            nk: b[32..64].try_into().unwrap(),
+            rivk: b[64..].try_into().unwrap(),
+        };
+        Wallet { fvk, exported }
+    }
+
+    /// A real NU7 v6 PCZT: one Ironwood spend of a 1,000,000-zat note owned
+    /// by `w`, a 500,000-zat payment encrypted under `payment_ovk`, and
+    /// 490,000 zat of change to the internal address under `change_ovk`.
+    fn ironwood_pczt(
+        w: &Wallet,
+        payment_ovk: Option<orchard::keys::OutgoingViewingKey>,
+        change_ovk: Option<orchard::keys::OutgoingViewingKey>,
+    ) -> Vec<u8> {
+        use incrementalmerkletree::{Hashable, Level};
+        use orchard::keys::Scope;
+        use orchard::note::{ExtractedNoteCommitment, NoteVersion, RandomSeed, Rho};
+        use orchard::tree::{MerkleHashOrchard, MerklePath};
+        use pczt::roles::{creator::Creator, io_finalizer::IoFinalizer};
+        use zcash_primitives::transaction::{
+            builder::{BuildConfig, Builder, BundlePadding, PcztResult},
+            fees::zip317,
+        };
+        use zcash_protocol::consensus::{BlockHeight, MAIN_NETWORK};
+        use zcash_protocol::memo::MemoBytes;
+        use zcash_protocol::value::Zatoshis;
+
+        let mut rng = rand_core::UnwrapErr(rand::rngs::SysRng);
+        let external = w.fvk.address_at(0u32, Scope::External);
+        let internal = w.fvk.address_at(0u32, Scope::Internal);
+
+        let mut n = 0u8;
+        let note: orchard::Note = loop {
+            n += 1;
+            let rho = Option::<Rho>::from(Rho::from_bytes(&[n; 32]));
+            let Some(rho) = rho else { continue };
+            let Some(rseed) = Option::<RandomSeed>::from(RandomSeed::from_bytes([n; 32], &rho))
+            else {
+                continue;
+            };
+            if let Some(note) = Option::<orchard::Note>::from(orchard::Note::from_parts(
+                external,
+                orchard::value::NoteValue::from_raw(1_000_000),
+                rho,
+                rseed,
+                NoteVersion::V3,
+            )) {
+                break note;
+            }
+        };
+        let cmx: ExtractedNoteCommitment = note.commitment().into();
+        let mut auth_path = [MerkleHashOrchard::empty_leaf(); 32];
+        for (level, sibling) in auth_path.iter_mut().enumerate() {
+            *sibling = MerkleHashOrchard::empty_root(Level::from(level as u8));
+        }
+        let merkle_path = MerklePath::from_parts(0, auth_path);
+
+        let mut builder = Builder::new(
+            MAIN_NETWORK,
+            BlockHeight::from_u32(3_600_000),
+            BuildConfig::Standard {
+                sapling_anchor: None,
+                orchard_anchor: None,
+                ironwood_anchor: Some(merkle_path.root(cmx)),
+                orchard_padding: BundlePadding::DEFAULT,
+                ironwood_padding: BundlePadding::DEFAULT,
+            },
+        );
+        builder
+            .add_ironwood_spend::<zip317::FeeRule>(w.fvk.clone(), note, merkle_path)
+            .unwrap();
+        builder
+            .add_ironwood_output::<zip317::FeeRule>(
+                payment_ovk,
+                external,
+                Zatoshis::const_from_u64(500_000),
+                MemoBytes::empty(),
+            )
+            .unwrap();
+        builder
+            .add_ironwood_output::<zip317::FeeRule>(
+                change_ovk,
+                internal,
+                Zatoshis::const_from_u64(490_000),
+                MemoBytes::empty(),
+            )
+            .unwrap();
+        let PcztResult { pczt_parts, .. } = builder
+            .build_for_pczt(&mut rng, &zip317::FeeRule::standard())
+            .unwrap();
+        IoFinalizer::new(Creator::build_from_parts(pczt_parts).unwrap())
+            .finalize_io(&mut rng)
+            .unwrap()
+            .serialize()
+            .unwrap()
+    }
+
+    fn ovk(w: &Wallet, scope: orchard::keys::Scope) -> Option<orchard::keys::OutgoingViewingKey> {
+        Some(w.fvk.to_ovk(scope))
+    }
+
+    #[test]
+    fn payment_and_change_both_go_out_with_the_full_body() {
+        use orchard::keys::Scope;
+        let w = wallet(7);
+        let bytes = ironwood_pczt(&w, ovk(&w, Scope::External), ovk(&w, Scope::Internal));
+        let signer = RecordingSigner { fvk: Some(w.exported.clone()), ..Default::default() };
+        let (result, signer) = sign(signer, bytes);
+
+        // The recording signer stops the flow at verification.
+        assert!(matches!(result, Err(HwSignerError::UserCancelled)), "{:?}", result);
+        assert_eq!(signer.verify_calls.len(), 1);
+        assert_eq!(signer.sign_calls, 0);
+
+        let actions = &signer.verify_calls[0];
+        assert_eq!(actions.len(), 2);
+        let mut values: Vec<u64> = actions.iter().map(|a| a.value).collect();
+        values.sort();
+        assert_eq!(values, vec![490_000, 500_000]);
+        for a in actions {
+            assert_eq!(a.pool, ShieldedPoolKind::Ironwood);
+            assert!(a.memo.is_some(), "{} zat output went out compact", a.value);
+            assert_eq!(a.serialize_v6().len(), 1416);
+        }
+    }
+
+    /// The plaintext of every output is rebuilt from the PCZT itself
+    /// (recipient / value / rseed + the action's rho), so the outgoing
+    /// viewing key an output was built with — someone else's, or none —
+    /// does not matter, and neither does the device's FVK: every action
+    /// goes out with the full body.
+    #[test]
+    fn outputs_go_out_with_the_full_body_whatever_their_ovk() {
+        use orchard::keys::Scope;
+        let w = wallet(7);
+        let stranger = wallet(9);
+        for (payment_ovk, change_ovk, device_fvk) in [
+            (ovk(&stranger, Scope::External), ovk(&w, Scope::Internal), Some(w.exported.clone())),
+            (ovk(&w, Scope::External), None, Some(w.exported.clone())),
+            (None, None, None),
+        ] {
+            let bytes = ironwood_pczt(&w, payment_ovk, change_ovk);
+            let signer = RecordingSigner { fvk: device_fvk, ..Default::default() };
+            let (result, signer) = sign(signer, bytes);
+            assert!(matches!(result, Err(HwSignerError::UserCancelled)), "{:?}", result);
+            assert_eq!(signer.verify_calls.len(), 1);
+            for a in &signer.verify_calls[0] {
+                assert!(a.memo.is_some(), "{} zat output went out compact", a.value);
+                assert_eq!(a.serialize_v6().len(), 1416);
+            }
+        }
+    }
+}
+
+// ── UFVK encoding (zcash_address 0.14 is ZIP 316 revision-aware) ──────────
+
+mod ufvk_encoding_tests {
+    use crate::types::ExportedFvk;
+    use zcash_address::unified::{self, Container, Encoding};
+    use zcash_protocol::consensus::{Network, NetworkType};
+
+    fn sample_fvk() -> ExportedFvk {
+        let sk = orchard::keys::SpendingKey::from_bytes([7u8; 32]).unwrap();
+        let bytes = orchard::keys::FullViewingKey::from(&sk).to_bytes();
+        ExportedFvk {
+            ak: bytes[..32].try_into().unwrap(),
+            nk: bytes[32..64].try_into().unwrap(),
+            rivk: bytes[64..].try_into().unwrap(),
+        }
+    }
+
+    /// The pairing UFVK stays a ZIP 316 Revision 0 container with the
+    /// original `uview` / `uviewtest` prefixes (what watch-only wallets
+    /// created by earlier SDK versions hold), carrying only the Orchard FVK.
+    #[test]
+    fn ufvk_is_revision_0_orchard_only_with_legacy_hrp() {
+        let fvk = sample_fvk();
+        for (network, net_type, prefix) in [
+            (Network::MainNetwork, NetworkType::Main, "uview1"),
+            (Network::TestNetwork, NetworkType::Test, "uviewtest1"),
+        ] {
+            let encoded = fvk.to_ufvk_string(&network).unwrap();
+            assert!(encoded.starts_with(prefix), "{}", encoded);
+
+            let (decoded_net, revision, ufvk) = unified::Ufvk::decode(&encoded).unwrap();
+            assert_eq!(decoded_net, net_type);
+            assert_eq!(revision, unified::Revision::R0);
+            assert_eq!(
+                ufvk.items(),
+                vec![unified::Fvk::Orchard(fvk.to_orchard_fvk_bytes())]
+            );
+        }
     }
 }

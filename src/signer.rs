@@ -29,7 +29,7 @@ use crate::traits::HardwareSigner;
 use crate::transport::Transport;
 use crate::types::{
     ActionData, ExportedFvk, SignRequest, SignResponse, TransparentInputData,
-    TransparentOutputData, TransparentSignRequest, TransparentSignResponse, TxDetails, TxMeta,
+    TransparentOutputData, TxDetails, TxMeta,
 };
 
 use tracing::{debug, info};
@@ -172,6 +172,12 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
         Ok(true)
     }
 
+    fn supports_transparent_inputs(&self) -> bool {
+        // The HWP device firmware (libzcash-ironwood-c) does not sign
+        // transparent inputs. Transparent outputs are supported.
+        false
+    }
+
     fn verify_transaction(
         &mut self,
         meta: &TxMeta,
@@ -180,6 +186,11 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
         transparent_inputs: &[TransparentInputData],
         transparent_outputs: &[TransparentOutputData],
     ) -> Result<()> {
+        if !transparent_inputs.is_empty() {
+            return Err(crate::error::HwSignerError::TransparentInputsNotSupported {
+                inputs: transparent_inputs.len(),
+            });
+        }
         let total_actions = actions.len() as u16;
         let num_t_inputs = transparent_inputs.len() as u16;
         let num_t_outputs = transparent_outputs.len() as u16;
@@ -245,10 +256,10 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
         //
         //    v6-only: every payload is prefixed with a pool byte (0x00
         //    Orchard, 0x01 Ironwood) so the device hashes the action into
-        //    the correct pool digest tree, and appends the memo (when
-        //    recoverable — not an OVK-None output) so the device can
-        //    recompute enc_ciphertext on-chip and reject any host that
-        //    embeds a different memo on chain than what the user is shown.
+        //    the correct pool digest tree, and carries the memo so the
+        //    device can recompute enc_ciphertext on-chip and reject any
+        //    host that embeds a different memo on chain than what the user
+        //    is shown. The device requires this for every output.
         //    The strict device rejects untagged legacy payloads outright.
         for (i, action) in actions.iter().enumerate() {
             let output_data = action.serialize_v6();
@@ -261,7 +272,7 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
                 output_data.len(),
                 match output_data.len() {
                     1416 => "memo-verifying",
-                    _ => "cmx-only",
+                    _ => "compact (refused by current firmware)",
                 },
             );
         }
@@ -275,26 +286,6 @@ impl<T: Transport> HardwareSigner for DeviceSigner<T> {
         info!("ZIP-244 shielded sighash verified — device VERIFIED.");
 
         Ok(())
-    }
-
-    fn sign_transparent_input(
-        &mut self,
-        request: &TransparentSignRequest,
-        input_data: &TransparentInputData,
-    ) -> Result<TransparentSignResponse> {
-        info!(
-            "Sending transparent sign request (input {}/{})",
-            request.input_index + 1,
-            request.total_inputs,
-        );
-
-        let response = self.codec.sign_transparent(
-            request.input_index as u16,
-            request.total_inputs as u16,
-            &input_data.serialize(),
-        )?;
-        info!("Transparent signature received from device.");
-        Ok(response)
     }
 }
 

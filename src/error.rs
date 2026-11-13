@@ -52,6 +52,19 @@ pub enum HwSignerError {
     #[error("Unsupported pool: {0}")]
     UnsupportedPool(&'static str),
 
+    /// Transparent inputs are not supported. Raised by the workflow for a
+    /// PCZT that spends transparent coins — before any proof is generated
+    /// and before anything is sent to the device, with the number of inputs
+    /// — and for the device's own refusal (HWP 0x18, `inputs: 0`: the device
+    /// does not say how many). Transparent *outputs* (shielded -> t-address)
+    /// are not affected.
+    #[error(
+        "Transparent inputs are not supported by this device ({inputs} transparent \
+         input(s) in the PCZT; 0 = refused by the device itself); only shielded spends \
+         can be signed"
+    )]
+    TransparentInputsNotSupported { inputs: usize },
+
     #[error(
         "Sapling components not supported: this is an Orchard-only signer (PCZT has \
          {spends} sapling spend(s) and {outputs} sapling output(s))"
@@ -71,8 +84,64 @@ pub enum HwSignerError {
     #[error("Recipient mismatch on device: {reason}")]
     RecipientMismatch { reason: String },
 
-    #[error("Transparent signature verification failed on input {input_idx}: {reason}")]
-    TransparentSignatureVerificationFailed { input_idx: usize, reason: String },
+    /// Device refused an action because it was sent as the compact
+    /// (no-memo, 904-byte) body (HWP 0x14). The device re-encrypts the note
+    /// of every output — payments, the wallet's own change and zero-value
+    /// padding alike — so the host must send the full 1416-byte body with
+    /// the memo plaintext for every action. The session has been reset.
+    #[error(
+        "Device requires the memo-carrying action body for every output \
+         (compact body refused): {reason}"
+    )]
+    MemoRequired { reason: String },
+
+    /// Device refused the transaction's consensus branch ID: it is not in
+    /// the firmware's allow-list (HWP 0x15). A network upgrade the firmware
+    /// does not know needs a firmware update.
+    #[error("Consensus branch not supported by the device firmware: {reason}")]
+    BranchNotAllowed { reason: String },
+
+    /// The transaction exceeds what the device can review: too many shielded
+    /// actions, transparent outputs or memos, or a memo on a device with no
+    /// way to display one (HWP 0x16). Nothing was signed.
+    #[error("Transaction exceeds what the device can review: {reason}")]
+    DeviceLimitExceeded { reason: String },
+
+    /// The device refused a TxMeta that declares a non-zero value balance
+    /// for a shielded pool with no action in the transaction (HWP 0x19):
+    /// that number is not bound by the signature hash, so the device will
+    /// not fold it into the fee it shows.
+    #[error("Non-zero value balance for a shielded pool without actions: {reason}")]
+    EmptyPoolBalance { reason: String },
+
+    /// An output value, a value balance or a total above MAX_MONEY, or a
+    /// sum that overflows 64 bits, on the device (HWP 0x17). Nothing was
+    /// signed.
+    #[error("Output values overflow on device: {reason}")]
+    ValueOverflow { reason: String },
+
+    /// The PCZT handed to the workflow is malformed or internally
+    /// inconsistent (it does not parse, or its transaction effects cannot be
+    /// extracted). Raised before any proof is generated or any transaction
+    /// data is sent to the device.
+    #[error("Invalid PCZT: {0}")]
+    InvalidPczt(String),
+
+    /// The host could not reconstruct the note plaintext (memo) of a
+    /// shielded output from the PCZT: the note described by the PCZT's
+    /// `(recipient, value, rseed)` and the action's nullifier does not open
+    /// `enc_ciphertext`. The device needs the memo-carrying action body for
+    /// every output (zero-value padding included), so the transaction
+    /// cannot be submitted. Raised before any proof is generated and before
+    /// any transaction data is sent to the device.
+    #[error("Cannot recover the plaintext of {pool} output {action_idx} ({value} zat): {reason}")]
+    OutputNotRecoverable {
+        pool: &'static str,
+        action_idx: usize,
+        value: u64,
+        reason: String,
+    },
+
 
     /// Device attestation failed: the connected device is not the one paired,
     /// or the response signature is invalid (audit M1).

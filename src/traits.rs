@@ -1,7 +1,7 @@
-use crate::error::{HwSignerError, Result};
+use crate::error::Result;
 use crate::types::{
     ActionData, ExportedFvk, SignRequest, SignResponse, TransparentInputData,
-    TransparentOutputData, TransparentSignRequest, TransparentSignResponse, TxDetails, TxMeta,
+    TransparentOutputData, TxDetails, TxMeta,
 };
 
 /// Trait that any hardware wallet must implement to participate in
@@ -112,23 +112,13 @@ pub trait HardwareSigner {
         Ok(())
     }
 
-    /// Sign a single transparent input (ECDSA secp256k1).
-    ///
-    /// Unlike Orchard/Sapling where the shielded sighash is shared across all
-    /// spends, transparent has a **per-input sighash** that commits to the
-    /// specific input's script and value. The device computes this sighash
-    /// on-device from its stored transparent state + the input data.
-    ///
-    /// The `input_data` contains the full wire-format input for on-device
-    /// txin_sig_digest computation.
-    ///
-    /// The default implementation returns `UnsupportedPool` — Orchard-only
-    /// devices don't need to implement this.
-    fn sign_transparent_input(
-        &mut self,
-        _request: &TransparentSignRequest,
-        _input_data: &TransparentInputData,
-    ) -> Result<TransparentSignResponse> {
-        Err(HwSignerError::UnsupportedPool("transparent"))
+    /// Whether this signer can authorize transparent inputs. Always
+    /// `false` for the HWP device, and [`crate::PcztHardwareSigning`] refuses
+    /// a PCZT with transparent inputs
+    /// ([`crate::error::HwSignerError::TransparentInputsNotSupported`]) whatever this
+    /// returns: the workflow has no transparent signing path. Kept so that
+    /// callers can ask before building a transaction.
+    fn supports_transparent_inputs(&self) -> bool {
+        false
     }
 }

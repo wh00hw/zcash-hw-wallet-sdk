@@ -128,7 +128,6 @@ impl HardwareSigner for MyDevice {
     // Provided defaults you can override:
     //   confirm_transaction(details)          -> Ok(true)  (auto-confirm, headless)
     //   verify_transaction(...)               -> Ok(())    (no on-device verification)
-    //   sign_transparent_input(req, input)    -> Err(UnsupportedPool)
 }
 
 // Use it
@@ -162,7 +161,7 @@ The SDK orchestrates the full PCZT pipeline automatically:
                         and drives per-output + fee user confirmation
                         before allowing signing.
          |
-6. User Confirmation    Optional: display TxDetails on device screen
+6. User Confirmation    Optional host-side hook (TxDetails are NOT shown by the device)
          |
 7. Hardware Signing     For each action, send SignRequest to device:
                         - sighash (32 bytes, same for all actions)
@@ -197,7 +196,7 @@ The core trait any hardware device must implement:
 | `sign_action(request)` | Sign a single Orchard/Ironwood action given sighash + alpha | Once per action |
 | `confirm_transaction(details)` | Display tx on device for user confirmation | Once per tx (optional, default: auto-confirm) |
 | `verify_transaction(meta, actions, sighash, t_inputs, t_outputs)` | Send tx metadata + shielded actions + transparent flow for on-device sighash + cmx + enc_ciphertext + fee verification | Once per tx (optional, default: no-op) |
-| `sign_transparent_input(request, input_data)` | Sign a transparent input on-device (ECDSA secp256k1) | Once per transparent input (optional, default: `Err(UnsupportedPool)`) |
+| `supports_transparent_inputs()` | Always `false` (default and `DeviceSigner`): transparent inputs are not supported. `PcztHardwareSigning` refuses a PCZT with transparent inputs with `HwSignerError::TransparentInputsNotSupported` before proving and before anything is sent to the device. Transparent **outputs** (shielded → t-address) are supported | — |
 
 ### `workflow` -- `PcztHardwareSigning<S>`
 
@@ -253,7 +252,7 @@ pub trait Transport {
 
 ### `protocol` -- Hardware Wallet Protocol (HWP) v6 only
 
-Binary framed protocol designed for constrained devices. **This branch is v6-only** (post-NU6.3, intended for merge after Zcash mainnet activates NU6.3): the host emits exclusively the v6 wire tier — 170-byte TxMeta, pool-tagged 904/1416-byte action payloads, five-leaf sighash tree — and rejects any PCZT whose consensus branch ID predates NU6.3 or whose transaction version is not v6 before proof generation. The matching strict device (`libzcash-ironwood-c`, branch `v6-only`) rejects the legacy tiers on the wire: 125/129-byte v5 TxMeta → `Error(BAD_META)`, untagged 903/1415-byte actions → `Error(BAD_FRAME)`. Earlier tiers layered in ZIP-244 sighash verification (v2), transparent digest verification + ECDSA signing (v3), Orchard cmx + per-action user confirmation + device attestation (v4), and on-device `enc_ciphertext` recomputation (memo binding) + explicit miner-fee confirmation (v5); their security features all carry forward into v6, only their wire layouts are gone.
+Binary framed protocol designed for constrained devices. **This branch is v6-only** (NU6.3 and NU7): the host emits exclusively the v6 wire tier — 170-byte TxMeta, pool-tagged 1416-byte action payloads (full note plaintext for every output), five-leaf sighash tree — and rejects any PCZT whose consensus branch ID is not NU6.3 (`0x37a5165b`) or NU7 (`0x77190ad9`), or whose transaction version is not v6, with a typed error before proof generation and before anything is sent to the device (a PCZT that does not parse, or whose effects cannot be extracted, is `InvalidPczt`). The matching strict device (`libzcash-ironwood-c`, branch `v6-only`) rejects the legacy tiers on the wire: 125/129-byte v5 TxMeta → `Error(BAD_META)`, untagged 903/1415-byte actions → `Error(BAD_FRAME)`. Earlier tiers layered in ZIP-244 sighash verification (v2), transparent digest verification + ECDSA signing (v3), Orchard cmx + per-action user confirmation + device attestation (v4), and on-device `enc_ciphertext` recomputation (memo binding) + explicit miner-fee confirmation (v5); their security features all carry forward into v6, only their wire layouts are gone.
 
 **Frame format:**
 
@@ -282,8 +281,8 @@ Binary framed protocol designed for constrained devices. **This branch is v6-onl
 | `Abort` | 0x0A | Host -> Device | Cancel signing session |
 | `TxTransparentInput` | 0x0B | Host -> Device | Transparent input for on-device digest verification |
 | `TxTransparentOutput` | 0x0C | Host -> Device | Transparent output for on-device digest verification |
-| `TransparentSignReq` | 0x0D | Host -> Device | Sign transparent input (ECDSA secp256k1) |
-| `TransparentSignRsp` | 0x0E | Device -> Host | DER signature + sighash_type + compressed pubkey |
+| `TransparentSignReq` | 0x0D | Host -> Device | Not sent by this SDK; the device answers `TransparentInputsUnsupported` (0x18) |
+| `TransparentSignRsp` | 0x0E | Device -> Host | Retired: never sent by current firmware |
 | `IdentityReq` | 0x0F | Host -> Device | Request device identity pubkey (first pairing) |
 | `IdentityRsp` | 0x10 | Device -> Host | Identity pubkey: `device_pubkey[32]` |
 | `AttestReq` | 0x11 | Host -> Device | Attestation challenge: `challenge[32]` |
@@ -303,6 +302,8 @@ The `coin_type` tells the device which ZIP-32 derivation path to use (`m/32'/coi
 sighash[32] || alpha[32] || amount[8 LE] || fee[8 LE] || recipient_len[1] || recipient[N]
 ```
 
+The device uses `sighash` (it must be the one it verified) and `alpha`. `amount`, `fee` and `recipient` are **ignored by the device** — not validated, not displayed; the recipient may be empty. The final confirmation screen shows totals the device computed itself. `sign()` / `sign_with_details()` keep their signatures: the `TxDetails` passed to `sign_with_details` are handed to `HardwareSigner::confirm_transaction` (host-side logging / a custom signer's own prompt) and copied into `SIGN_REQ` for older firmware, but nothing in them reaches the HWP device's screen. The device gives at most one signature per action of the approved transaction.
+
 **TX_OUTPUT payload — on-device sighash + cmx + enc_ciphertext + fee verification:**
 
 ```
@@ -312,8 +313,8 @@ output_index[2 LE] || total_outputs[2 LE] || action_data[N]
 Three types of TxOutput messages are used, discriminated by `output_index`:
 
 - `output_index = 0xFFFF` — **Transaction metadata** (v6 layout, 170 bytes — the only one this host emits): `version[4] || version_group_id[4] || consensus_branch_id[4] || lock_time[4] || expiry_height[4] || orchard_flags[1] || value_balance[8 LE signed] || anchor[32] || ironwood_flags[1] || ironwood_value_balance[8 LE signed] || ironwood_anchor[32] || transparent_sig_digest[32] || sapling_digest[32] || coin_type[4 LE]`. The legacy 129-byte v5 layout is rejected by the strict device (`Error/BAD_META`).
-- `output_index = 0..N-1` — **Action + full note plaintext**. For v6 transactions (the only kind produced post-NU6.3) the SDK emits the **pool-tagged 1416-byte payload**: `pool_tag[1] || cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] || memo[512]`. The trailing 595 bytes (recipient + value + rseed + memo) let the device recompute both `cmx` (Sinsemilla) AND `enc_ciphertext` (ChaCha20-Poly1305 with `K_enc = BLAKE2b(epk‖[esk]·pk_d)`, esk derived on-chip from rseed+rho per ZIP-212). Closes both recipient-substitution and memo-substitution attacks. When the memo is not recoverable on the host side (`OVK::None` outputs) the pool-tagged **904-byte** cmx-only form is sent instead; the wallet's normal flow (`OvkPolicy::Sender`) does not use this fallback. Untagged legacy 903/1415-byte payloads no longer exist on this branch — the strict device rejects them with `Error(BAD_FRAME)`.
-- `output_index = N` (sentinel): Expected 32-byte ZIP-244 sighash for device comparison. Triggers the per-output review loop on-device and then the fee-confirmation step (`get_fee` → user OK → `confirm_fee`) before final `verify()`.
+- `output_index = 0..N-1` — **Action + full note plaintext**. The SDK emits the **pool-tagged 1416-byte payload**: `pool_tag[1] || cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] || enc_ciphertext[580] || out_ciphertext[80] || recipient[43] || value[8 LE] || rseed[32] || memo[512]`. The trailing 595 bytes (recipient + value + rseed + memo) let the device recompute both `cmx` (Sinsemilla) AND `enc_ciphertext` (ChaCha20-Poly1305 with `K_enc = BLAKE2b(epk‖[esk]·pk_d)`, esk derived on-chip from rseed+rho per ZIP-212). **Every action must be sent in this form — payments, the wallet's own change and the builder's zero-value padding alike**: the device answers the compact (904-byte, no memo) form with `MemoRequired` (`0x14`) whatever the output. Action frames must be sent in order (`0, 1, …, N-1`), each exactly once, all with the `total_outputs` announced with the metadata; `N` must be at least 1. Untagged legacy 903/1415-byte payloads are rejected with `Error(BAD_FRAME)`.
+- `output_index = N` (sentinel): Expected 32-byte ZIP-244 sighash for device comparison. Triggers the on-device review — every transparent output, every shielded output with a value or a memo (labelled by the device, from its own keys, as external, the wallet's change or one of the wallet's own addresses), then the totals (what leaves the wallet, and the fee) — and only then the sighash comparison. The host just waits for the `TxOutputAck`; a refusal at any screen comes back as `UserCancelled`.
 
 **Error codes:**
 
@@ -332,14 +333,22 @@ Three types of TxOutput messages are used, discriminated by `output_index`:
 | 0x0B | `TransparentDigestMismatch` | Device-computed transparent digest differs from companion |
 | 0x0C | `SaplingNotEmpty` | `sapling_digest` ≠ ZIP-244 empty-bundle constant (Orchard-only invariant) |
 | 0x0D | `NoteCommitmentMismatch` | Device-recomputed cmx ≠ action.cmx — recipient-substitution attempt |
-| 0x0E | `RecipientMismatch` | SIGN_REQ.recipient (UA) does not match any action confirmed on-device |
+| 0x0E | `RecipientMismatch` | Reserved; no longer sent (the device ignores `SIGN_REQ.recipient`) |
 | 0x0F | `MemoMismatch` | Device-recomputed enc_ciphertext (or epk) ≠ action — memo-substitution attempt |
 | 0x10 | `BadPkD` | `pk_d` does not decode to a valid Pallas point |
 | 0x11 | `FeeNotConfirmed` | `verify()` reached without user approving the on-device-computed fee |
 | 0x12 | `FeeOverflow` | Transparent value sums or `value_balance` combine to an out-of-range fee |
 | 0x13 | `FeeNegative` | `t_in + value_balance < t_out` — companion built an unbalanced bundle |
+| 0x14 | `MemoRequired` | An action arrived in the compact (904-byte) form: the device needs the memo-carrying body for every output, zero-value padding included |
+| 0x15 | `BranchNotAllowed` | TxMeta consensus branch ID is not in the firmware's allow-list (NU6.3 `0x37a5165b`, NU7 `0x77190ad9`) |
+| 0x16 | `LimitExceeded` | More actions, transparent outputs or memos than the device can review, or a memo on a device that cannot display one |
+| 0x17 | `ValueOverflow` | An output value, a value balance or a total above MAX_MONEY (21,000,000 ZEC), or a sum that does not fit in 64 bits |
+| 0x18 | `TransparentInputsUnsupported` | The transaction has transparent inputs, or a `TransparentSignReq` was sent: the device does not sign transparent inputs |
+| 0x19 | `EmptyPoolBalance` | TxMeta declares a non-zero value balance for a shielded pool (Orchard / Ironwood) that has no action in the transaction |
 
-> The wire protocol (canonical definition in `libzcash-ironwood-c`'s `hwp.h`) defines codes `0x00` (`Unknown`) through `0x13`; the SDK's typed `ErrorCode` enum mirrors the full range. `UserCancelled`, `SighashMismatch`, `TransparentDigestMismatch`, `SaplingNotEmpty`, `NoteCommitmentMismatch`, and `RecipientMismatch` map to dedicated `HwSignerError` variants; the remaining codes surface as `HwSignerError::DeviceError` with the code name and the device's message string.
+> The wire protocol (canonical definition in `libzcash-ironwood-c`'s `hwp.h`) defines codes `0x00` (`Unknown`) through `0x19`; the SDK's typed `ErrorCode` enum mirrors the full range. `UserCancelled`, `SighashMismatch`, `TransparentDigestMismatch`, `SaplingNotEmpty`, `NoteCommitmentMismatch`, `RecipientMismatch`, `MemoRequired`, `BranchNotAllowed`, `LimitExceeded` (as `HwSignerError::DeviceLimitExceeded`), `ValueOverflow`, `TransparentInputsUnsupported` (as `HwSignerError::TransparentInputsNotSupported { inputs: 0 }`) and `EmptyPoolBalance` map to dedicated `HwSignerError` variants; the remaining codes surface as `HwSignerError::DeviceError` with the code name and the device's message string. Every `Error` frame ends the device's session (a verified transaction and its approvals included): the host starts again from the metadata. A new TxMeta always starts a new transaction, so the host does not have to close the previous one.
+>
+> With the November 2026 device firmware some conditions changed code: too many actions is `LimitExceeded` (was `BadFrame`), and a fee overflow / negative fee found during the review is `FeeOverflow` / `FeeNegative` (was `UserCancelled`). Transparent inputs are refused by the device (`TransparentInputsUnsupported`, and by this SDK before that); the device's network is fixed by its firmware and TxMeta must carry the matching `coin_type`; a transaction with no shielded action is refused; a ninth transparent output is `LimitExceeded` on the first transparent-output frame. The device also has its own branch allow-list now — the host's branch gate (above) fails earlier and with a more specific error, so `BranchNotAllowed` is only seen with a firmware built for fewer branches than the host supports.
 
 ### `verify` -- Signature Verification
 
@@ -355,8 +364,8 @@ This prevents both key confusion attacks and invalid signatures.
 Typed error enum covering all failure modes:
 
 - **PCZT workflow**: `ProofFailed`, `SignerInitFailed`, `NoActionsToSign`, `ExtractionFailed`, `SaplingNotSupported`, `UnsupportedPool`
-- **Signatures**: `RkMismatch`, `SignatureVerificationFailed`, `InvalidVerificationKey`, `TransparentSignatureVerificationFailed`
-- **On-device verification**: `NoteCommitmentMismatch`, `RecipientMismatch`, `TransparentSighashMismatch`, `InvalidTransparentInputIndex`, `NetworkMismatch`
+- **Signatures**: `RkMismatch`, `SignatureVerificationFailed`, `InvalidVerificationKey`, `OutputNotRecoverable`
+- **On-device verification**: `NoteCommitmentMismatch`, `MemoRequired`, `BranchNotAllowed`, `DeviceLimitExceeded`, `ValueOverflow`, `EmptyPoolBalance`, `TransparentInputsNotSupported`, `TransparentSighashMismatch`, `NetworkMismatch` (`RecipientMismatch` is kept for older firmware)
 - **Device**: `DeviceError`, `UserCancelled`, `AttestationFailed`
 - **Transport**: `TransportError`, `ConnectionFailed`, `Timeout`
 - **Protocol**: `ProtocolError`, `CrcMismatch`, `UnsupportedVersion`, `UnknownMessageType`, `PayloadTooLarge`, `RecipientTooLong`, `MaxKeepaliveExceeded`, `SequenceMismatch`
@@ -399,17 +408,17 @@ ZIP-244 action data + note plaintext sent to the device for on-device sighash + 
 | `cmx` | `[u8; 32]` | Extracted note commitment (the device verifies this matches `Extract_P(NoteCommit(g_d, pk_d, value, rho, psi))` recomputed from the trailing note plaintext) |
 | `ephemeral_key` | `[u8; 32]` | Ephemeral public key (the device recomputes this as `[esk]·g_d` and constant-time compares against the on-action value) |
 | `enc_ciphertext` | `Vec<u8>` | Encrypted note plaintext (580 bytes); the device recomputes this from the trailing plaintext via ChaCha20-Poly1305 and constant-time compares |
-| `out_ciphertext` | `Vec<u8>` | Encrypted outgoing plaintext (80 bytes); used by the SDK to recover the memo via the device's OVK before transmission |
+| `out_ciphertext` | `Vec<u8>` | Encrypted outgoing plaintext (80 bytes); hashed into the sighash, not otherwise used by the SDK |
 | `recipient` | `[u8; 43]` | **Output-note recipient** — raw 43-byte Orchard payment-address encoding (`d[11] || pk_d[32]`). The device recomputes `cmx` + `enc_ciphertext` from this and rejects mismatches; the UI then encodes it as a Bech32m UA via `orchard_encode_ua_raw` and shows it to the user for confirmation. |
 | `value` | `u64` | **Output-note value** in zatoshis. Verified via cmx + enc_ciphertext; displayed to the user. |
 | `rseed` | `[u8; 32]` | **Output-note random seed**. Required input to the device's `psi` / `rcm` derivation per Orchard `§ 4.7.3` **and** to the ZIP-212 esk derivation used for memo verification. |
-| `memo` | `Option<[u8; 512]>` | **Output-note memo plaintext** (ZIP-302). Recovered on the host side by trial-decrypting `out_ciphertext` with the device's external OVK (`try_output_recovery_with_ovk`). Sent as the trailing 512 bytes of the memo-verifying wire format so the device can recompute `enc_ciphertext` and reject any host that embeds a different memo on chain than what the user is shown. `None` for `OVK::None` outputs — falls back to the cmx-only wire format for that action. |
+| `memo` | `Option<[u8; 512]>` | **Output-note memo plaintext** (ZIP-302). Rebuilt on the host from the PCZT alone: `(recipient, value, rseed)` and the action's nullifier (rho) determine the note and its ephemeral secret key, and `(pk_d, esk)` opens `enc_ciphertext` (`try_output_recovery_with_pkd_esk`) — no viewing key is involved, so payments, change and zero-value padding are all covered. Sent as the trailing 512 bytes of the wire format so the device can recompute `enc_ciphertext`. The workflow always sets it; an output it cannot open makes it fail with `OutputNotRecoverable`. `None` produces the compact form, which the device refuses. |
 
 `esk` is never part of the struct or the wire — the device derives it on-chip from `rseed + rho` per ZIP-212.
 
-Wire formats: `ActionData::serialize_v6()` — the only action wire format on this branch — emits the pool-tagged **1416-byte** memo-verifying payload, or the pool-tagged **904-byte** cmx-only form when `memo` is `None`. The untagged 903-byte legacy serialization is private (it is only the base of the v6 formats) and never sent on the wire.
+Wire formats: `ActionData::serialize_v6()` — the only action wire format on this branch — emits the pool-tagged **1416-byte** memo-verifying payload. (With `memo: None` it emits the pool-tagged 904-byte compact form, which current firmware refuses for every output; the workflow never produces it.) The untagged 903-byte legacy serialization is private and never sent on the wire.
 
-The trailing `(recipient, value, rseed, memo)` block is what closes both the recipient-substitution attack AND the memo-substitution attack a hostile companion would otherwise mount inside the Orchard bundle. Without `recipient/value/rseed` the device cannot verify cmx; without `memo` it cannot verify enc_ciphertext. With both, it recomputes Sinsemilla-NoteCommit + ChaCha20-Poly1305 on-device and rejects any swap.
+The trailing `(recipient, value, rseed, memo)` block is what the host contributes to on-device output verification: without `recipient/value/rseed` the device cannot recompute cmx; without `memo` it cannot recompute `enc_ciphertext`. The host's rule is therefore to send the full 1416-byte body for **every** output, and to refuse to start (typed error `OutputNotRecoverable`, before proving, nothing sent) when it cannot rebuild one. **One exception:** in the sealed Orchard pool the upstream `orchard` builder gives the zero-value output it pairs with an external-scope spend a *random* `enc_ciphertext` by design; it cannot be opened. For an output in the Orchard pool with value 0 that does not open, the host still sends the full body, declaring 512 zero bytes of memo; the device tolerates the non-matching ciphertext only for a zero-value sealed-Orchard output to one of its own addresses with the expected `epk` and no memo, and does not show it. Every other output that does not open (any Ironwood output, any non-zero value) is `OutputNotRecoverable`.
 
 ### `ExportedFvk`
 
@@ -475,13 +484,13 @@ The wallet application drives network selection by passing `coin_type` in HWP pr
 1. **`coin_type` fixed at signer construction** — every `DeviceSigner` constructor (and the `connect_*` helpers) takes a `coin_type` (133 = mainnet, 1 = testnet), exposed through the required `HardwareSigner::coin_type()` method; the workflow derives the network from it
 2. **`export_fvk()`** — the SDK sends the signer's `coin_type` in the `FvkReq` payload; the device derives keys from `m/32'/coin_type'/account'`
 3. **`TxMeta`** carries `coin_type` (bytes 166-169) — the device validates that it matches the `coin_type` from `FvkReq`
-4. **Pre-proof validation** — v6-only: the SDK rejects any PCZT whose consensus branch ID predates NU6.3 (`0x37a5165b`) or whose transaction version is not v6 (`0x80000006`) before expensive Halo2 proof generation
+4. **Pre-proof validation** — v6-only: the SDK accepts exactly two consensus branch IDs, NU6.3 (`0x37a5165b`) and NU7 (`0x77190ad9`), and rejects any PCZT with another branch ID (older *or* newer) or whose transaction version is not v6 (`0x80000006`) before expensive Halo2 proof generation. NU7 keeps the v6 transaction format, the ZIP-244 digest personalizations and Orchard protocol revision V3, so the wire protocol and the device are unchanged; the device binds the branch ID through the sighash it recomputes
 
 If a mismatch is detected (e.g., `FvkReq(coin_type=133)` followed by `TxMeta(coin_type=1)`), the device returns `NetworkMismatch` (error 0x05).
 
 The `coin_type` extension in TxMeta (the trailing 4 bytes, 166-169 in the v6 layout) is **not** part of the ZIP-244 sighash computation — it is appended after the core fields for network validation only.
 
-**Note:** `consensus_branch_id` values (e.g., Nu5 = `0xc2d6d0b4`, Nu6.3 = `0x37a5165b`) are identical on mainnet and testnet. Only `coin_type` (133 vs 1) reliably distinguishes the networks, because it determines the ZIP-32 key derivation path.
+**Note:** `consensus_branch_id` values (e.g., Nu5 = `0xc2d6d0b4`, Nu6.3 = `0x37a5165b`, Nu7 = `0x77190ad9`) are identical on mainnet and testnet. Only `coin_type` (133 vs 1) reliably distinguishes the networks, because it determines the ZIP-32 key derivation path.
 
 ### NU6.3 / Ironwood (v6 transactions)
 
@@ -507,6 +516,16 @@ V3 quantum-recoverable note plaintexts per ZIP 2005). The SDK handles both:
   scheme; the workflow routes signatures back via
   `apply_orchard_signature` / `apply_ironwood_signature` per pool.
 
+**NU7** (consensus branch `0x77190ad9`; mainnet height 3,543,405, testnet
+4,465,026) keeps all of the above: same v6 transaction format, same ZIP-244
+personalizations, same Orchard protocol revision (V3 / post-NU6.3 circuit).
+What it changes for a wallet is timing — 25 s target block spacing, a default
+transaction expiry of target height + 120 blocks (was + 40), and the scaled
+ZIP 318 anchor / expiry grid — all of which are decided by the host wallet
+(`zcash_client_backend`), not by this SDK or the device. The only NU7-specific
+value on the wire is the branch ID in TxMeta, which the device hashes into the
+header digest and the sighash personalization.
+
 ## On-Device Verification — five composed invariants
 
 The SDK + device cooperate to enforce five security invariants, in order, before any RedPallas signature is produced. Each is a library-level state-machine invariant on the device side: a hostile firmware cannot extract a signature by skipping any of them, and no component of the ZIP-244 sighash or of any output note is taken on faith from the companion.
@@ -519,7 +538,7 @@ A compromised companion cannot trick the device into signing an arbitrary transa
 
 Per-component breakdown:
 - **`header_digest`** — recomputed on-device from `TxMeta` (`ZTxIdHeadersHash`)
-- **`transparent_sig_digest`** — when transparent inputs/outputs are present, the SDK streams them via `TxTransparentInput` / `TxTransparentOutput` and the device recomputes the digest from those bytes; constant-time compared against the value in `TxMeta`. For transparent signing, the device also produces the per-input sighash on-device (`amounts_digest`, `scripts_digest`, `txin_sig_digest`) and signs with ECDSA secp256k1.
+- **`transparent_sig_digest`** — when transparent inputs/outputs are present, the SDK streams them via `TxTransparentInput` / `TxTransparentOutput` and the device recomputes the digest from those bytes; constant-time compared against the value in `TxMeta`. In practice this covers transparent **outputs** (a shielded → t-address send): `DeviceSigner` does not submit transactions with transparent **inputs** — the workflow fails with `HwSignerError::TransparentInputsNotSupported` before proof generation and before any device I/O.
 - **`sapling_digest`** — *Orchard-only invariant*: the SDK refuses to send any PCZT containing Sapling spends or outputs (`HwSignerError::SaplingNotSupported`); the device additionally enforces `sapling_digest == BLAKE2b-256("ZTxIdSaplingHash", [])` on `TxMeta` receipt. Either side catches a hostile companion that would otherwise siphon value via a Sapling output the device never sees in the Orchard stream.
 - **`orchard_digest`** — recomputed on-device from streamed action data via three parallel BLAKE2b-256 digesters (compact / memos / non-compact)
 
@@ -533,16 +552,16 @@ The host-side fix is `HwSignerError::SaplingNotSupported` plus the per-action pl
 
 cmx covers `(d, pk_d, value, rho, rseed)` but does **not** cover the 512-byte memo. A host that has been forced through cmx-recomputation can still embed any memo plaintext inside `enc_ciphertext` and show the user a different one on its UI — the recipient sees the attacker's memo on chain.
 
-The SDK closes this by recovering the memo and forwarding it to the device for full ciphertext re-encryption. For each action, after the Halo2 proof step:
+The SDK's part is to recover the memo and forward it to the device for full ciphertext re-encryption. For each action, before the Halo2 proof step:
 
-1. `workflow.rs` calls `signer.export_fvk()` to obtain the device's Orchard FVK and derives the external `OutgoingViewingKey` (`fvk.to_ovk(Scope::External)`)
-2. For each `pczt::Action`, it calls `try_output_recovery_with_ovk` from `zcash_note_encryption`, decrypting `out_ciphertext` and then `enc_ciphertext` to recover `(note, address, memo)`
+1. For each `pczt::Action`, `workflow.rs` rebuilds the output note from the PCZT's `(recipient, value, rseed)` and the action's nullifier (rho) and derives its ephemeral secret key `esk`
+2. It calls `try_output_recovery_with_pkd_esk` from `zcash_note_encryption`, decrypting `enc_ciphertext` with `(pk_d, esk)` to recover `(note, address, memo)` — this also checks that the ciphertext really encrypts the note the PCZT describes
 3. The memo plaintext is stored in `ActionData::memo` and shipped to the device as the trailing 512 bytes of the memo-verifying wire payload (pool-tagged v6 format, 1416 B)
 4. The device recomputes `enc_ciphertext = ChaCha20-Poly1305(K_enc, IV=0, leadByte‖d‖value‖rseed‖memo)` with `K_enc = BLAKE2b("Zcash_OrchardKDF", repr_P(epk)‖repr_P([esk]·pk_d))` and `esk = ToScalar(PRF^expand(rseed,[0x04]‖ρ))` derived on-chip; ct-compares byte-for-byte against the action's `enc_ciphertext` AND `ephemeral_key`. Mismatch → `MemoMismatch` (HWP error `0x0F`).
 
 `esk` is **not** carried on the wire — both sides derive it deterministically from `rseed + rho` per ZIP-212, removing one trust-from-companion vector.
 
-Outputs constructed with `OVK::None` cannot be recovered by the sender; for those the SDK falls back to the cmx-only payload, and the device skips the memo check for that action. The wallet's normal flow uses `OvkPolicy::Sender` so this path is not exercised.
+No viewing key is needed for this (the device's FVK is not requested by the workflow): the outgoing viewing key an output was built with — the account's, someone else's, or none — makes no difference. An output whose ciphertext does not match the PCZT's note fields cannot be described to the device: `sign()` returns `HwSignerError::OutputNotRecoverable` before proving and before any transaction data is sent. This applies to zero-value outputs too (the device refuses the 904-byte form for every output, `MemoRequired`), with the single exception of the sealed-Orchard zero-value output of a turnstile transaction described under `ActionData` above, which is sent with a zero memo.
 
 ### 4. Per-action user confirmation (no blind signing)
 
@@ -561,9 +580,9 @@ cmx + enc_ciphertext + per-action confirmation guarantee the user sees every out
 Defence:
 
 1. The device tracks per-input / per-output transparent value totals in `Zip244TransparentState` with overflow flags
-2. After the per-action review loop, the dispatcher calls `orchard_signer_get_fee()`, which computes `fee = t_in_total − t_out_total + value_balance` with i64 overflow detection and a non-negative check (`FeeOverflow` / `FeeNegative` on hostile values)
-3. The fee is rendered on the trusted screen (via a dedicated `ui.review_fee` callback if the firmware provides one, or via a backward-compat fallback to `ui.review_output` with `addr_str = "Network fee"`)
-4. Only after explicit user OK does the dispatcher call `orchard_signer_confirm_fee()`, allowing `orchard_signer_verify()` to advance past `FeeNotConfirmed`
+2. At the sighash sentinel the device computes the transaction's totals itself: `fee = t_in_total − t_out_total + value_balance(Orchard) + value_balance(Ironwood)` and the total leaving the wallet (external shielded outputs + transparent outputs + fee), with overflow and non-negative checks (`FeeOverflow` / `FeeNegative` / `ValueOverflow` on hostile values, reported before any screen is shown)
+3. After the per-output review, the totals are rendered on the trusted screen (a mandatory screen of the device firmware)
+4. Only after explicit user OK does the device go on to compare the sighash; the final confirmation at the first `SIGN_REQ` shows the same device-computed totals again. The `amount` and `fee` fields the host puts in `SIGN_REQ` are ignored by the device
 
 The SDK does not need any change for this either; the fee math + confirmation flow is fully device-side and is driven automatically by the HWP dispatcher in `libzcash-ironwood-c`.
 
@@ -571,8 +590,8 @@ The SDK does not need any change for this either; the fee math + confirmation fl
 
 1. SDK extracts `TxMeta` from the PCZT (170 bytes, v6 layout only)
 2. `TxMeta` is sent as a `TxOutput` with `output_index = 0xFFFF` (metadata sentinel)
-3. SDK fetches OVK from device (via `signer.export_fvk()`) and trial-decrypts each action's `out_ciphertext` → `enc_ciphertext` to recover the memo plaintext
-4. SDK extracts each action's full components (pool-tagged 1416 bytes per action) — including the unencrypted `recipient[43]`, `value[8]`, `rseed[32]`, and `memo[512]`. Falls back to the pool-tagged cmx-only payload (904 B) when memo recovery fails (`OVK::None` output).
+3. SDK rebuilds each output note from the PCZT and opens `enc_ciphertext` with `(pk_d, esk)` to recover the memo plaintext (fails with `OutputNotRecoverable` if any output does not open)
+4. SDK extracts each action's full components (pool-tagged 1416 bytes per action, for every action) — including the unencrypted `recipient[43]`, `value[8]`, `rseed[32]`, and `memo[512]`.
 5. Each action is sent as a `TxOutput` message (index 0..N-1)
 6. Device recomputes cmx AND (when the full payload is sent) enc_ciphertext + epk; stores recipient/value for display
 7. SDK sends the expected sighash as a sentinel `TxOutput` (index = N)
@@ -597,12 +616,12 @@ The SDK does not need any change for this either; the fee math + confirmation fl
 | **CRC-16 framing** | Detects corrupted data on the wire. Auto-retries on CRC errors. | Active |
 | **ZIP-244 sighash verification** | Device independently computes the full ZIP-244 sighash from transaction data and refuses to sign on mismatch. | Active (via `DeviceSigner`) |
 | **Transparent digest verification** | Device computes transparent txid digest from raw inputs/outputs and verifies it matches TxMeta. Prevents forged transparent digests. | Active (via `DeviceSigner`) |
-| **Transparent per-input sighash** | Device computes per-input transparent sighash on-device (amounts, scripts, txin_sig digests) and signs with ECDSA secp256k1. | Active (via `DeviceSigner`) |
+| **Transparent inputs** | Not signed through `DeviceSigner`: a PCZT that spends transparent coins is refused on the host (`TransparentInputsNotSupported`) before proving and before any device I/O. Transparent outputs are reviewed on the device like any other output. | Refused (host) |
 | **Sapling-component lockout** | SDK rejects any PCZT with Sapling spends or outputs (`HwSignerError::SaplingNotSupported`) before transmission; device additionally enforces `sapling_digest == ZIP-244 empty-bundle constant` on `TxMeta` receipt. Prevents value siphoning via a hidden Sapling output the device never sees in the Orchard stream. | Active (via `DeviceSigner` + workflow) |
 | **NoteCommitment (cmx) verification** | Device recomputes `cmx = Extract_P(NoteCommit(g_d, pk_d, value, rho, psi))` for every Orchard action from the unencrypted note plaintext the SDK appends to each `TxOutput` payload, and rejects mismatches (`SIGNER_ERR_NOTE_COMMITMENT_MISMATCH`). Prevents a hostile companion from substituting the recipient between the displayed UI and the on-chain effect of the signed transaction. | Active (via `DeviceSigner`) |
 | **No-blind-signing invariant (per output)** | Device-side library refuses to advance the signer state to `VERIFIED` unless every captured action has been explicitly confirmed via `orchard_signer_confirm_action()`. The firmware UI is responsible for displaying recipient + value per output and capturing user approval; the lib enforces that without that step, no signature is produced. | Active (device-enforced) |
-| **Memo verification via enc_ciphertext recomputation** | SDK recovers each output's memo via the device's OVK (`try_output_recovery_with_ovk`) and ships it in the memo-verifying wire payload (pool-tagged v6). Device re-encrypts on-chip (Pallas ECDH + Orchard KDF + ChaCha20-Poly1305, esk derived from rseed+ρ per ZIP-212) and ct-compares against the action's `enc_ciphertext` + `ephemeral_key`; mismatch → `SIGNER_ERR_MEMO_MISMATCH`. Prevents a hostile companion from showing one memo on its UI and embedding another on chain. | Active (via `DeviceSigner` + workflow) |
-| **Miner-fee confirmation invariant** | Device computes `fee = transparent_in − transparent_out + value_balance` on-chip with overflow + negative detection, renders it on the trusted screen, and refuses to advance `verify()` until the user explicitly approves (`orchard_signer_confirm_fee()`). Prevents `value_balance` inflation that would silently siphon the surplus to miners. | Active (device-enforced) |
+| **Memo verification via enc_ciphertext recomputation** | SDK recovers each output's memo from the PCZT (`try_output_recovery_with_pkd_esk`) and ships it in the memo-verifying wire payload (pool-tagged v6). Device re-encrypts on-chip (Pallas ECDH + Orchard KDF + ChaCha20-Poly1305, esk derived from rseed+ρ per ZIP-212) and ct-compares against the action's `enc_ciphertext` + `ephemeral_key`; mismatch → `SIGNER_ERR_MEMO_MISMATCH`. Prevents a hostile companion from showing one memo on its UI and embedding another on chain. | Active (via `DeviceSigner` + workflow) |
+| **Miner-fee confirmation invariant** | Device computes `fee = transparent_in − transparent_out + value_balance` on-chip with overflow + negative detection, renders it on the trusted screen, and refuses to advance `verify()` until the user explicitly approves the totals (total leaving the wallet + fee). Prevents `value_balance` inflation that would silently siphon the surplus to miners. | Active (device-enforced) |
 
 **Protocol hardening:**
 
@@ -690,30 +709,29 @@ Together, the two projects form a complete plug-and-play stack: `libzcash-ironwo
 
 ## librustzcash Compatibility
 
-The SDK builds against the **published NU6.3-capable releases on crates.io** — `pczt 0.8.0-rc.1`, `orchard 0.15.0`, `zcash_primitives 0.29.0`, `zcash_protocol 0.10.0`. No `[patch.crates-io]` section is needed for a standalone build. The external-signing APIs it relies on are:
+The SDK builds against the **published NU7 release set on crates.io** (2026-10-21) — `pczt 0.10.0`, `orchard 0.16.0`, `zcash_primitives 0.31.0`, `zcash_protocol 0.11.0`, `zcash_address 0.14.0` — which covers both the NU6.3 and NU7 consensus branches. MSRV is Rust 1.89 (inherited from those crates). No `[patch.crates-io]` section is needed for a standalone build. The external-signing APIs it relies on are:
 
 - **`pczt`** — `Signer::shielded_sighash()` returns the computed sighash for external signing
 - **`pczt`** — `Signer::apply_orchard_signature(index, signature)` / `apply_ironwood_signature(index, signature)` inject an externally-produced RedPallas signature per pool
 - **`pczt`** — `low_level_signer::sign_orchard_with()` / `sign_ironwood_with()` provide callback access to the parsed bundle for reading alpha, rk, and action data
 
-These first landed upstream in commit [`feefa606`](https://github.com/zcash/librustzcash/commit/feefa606) ("pczt: Support appending external signatures to inputs", Nov 2025) and have shipped on crates.io since `pczt` 0.6.0; the Ironwood (PCZT v2) APIs shipped with `pczt` 0.8. The `librustzcash` git submodule in this repo is kept for reference only and is not part of the build. (When the SDK is built as a path dependency of the `zipher-app` workspace, the workspace root may still patch the zcash crates to a pinned librustzcash revision.)
+These first landed upstream in commit [`feefa606`](https://github.com/zcash/librustzcash/commit/feefa606) ("pczt: Support appending external signatures to inputs", Nov 2025) and have shipped on crates.io since `pczt` 0.6.0; the Ironwood (PCZT v2) APIs shipped with `pczt` 0.8. The `librustzcash` git submodule in this repo is kept for reference only and is not part of the build. (When the SDK is built as a path dependency of the `zipher-app` workspace, that workspace must be on the same crate set: `zcash_client_backend 0.25.0` / `zcash_client_sqlite 0.23.0`.)
 
 ## Dependencies
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `pczt` | 0.8.0-rc.1 | PCZT roles (prover, signer, extractor) — Ironwood-aware (PCZT v2) |
-| `orchard` | 0.15.0 | Orchard-protocol circuit keys, Ironwood pool, V3 notes |
-| `zcash_primitives` | 0.29.0 | Transaction data, `TxIdDigester`, transparent sighash |
-| `zcash_protocol` | 0.10.0 | Consensus parameters, branch IDs |
-| `zcash_address` | 0.13 | Unified Address encoding for display |
-| `reddsa` | 0.5 | RedPallas signature verification |
-| `secp256k1` | 0.29 | ECDSA transparent signature parsing |
-| `ff` | 0.13 | Finite field traits (alpha serialization) |
-| `zcash_note_encryption` | 0.4 | Trial-decrypt `out_ciphertext` → `enc_ciphertext` via the device OVK to recover the memo plaintext for memo-verification |
+| `pczt` | 0.10.0 | PCZT roles (prover, signer, extractor) — Ironwood-aware (PCZT v2) |
+| `orchard` | 0.16.0 | Orchard-protocol circuit keys, Ironwood pool, V3 notes |
+| `zcash_primitives` | 0.31.0 | Transaction data, `TxIdDigester`, transparent sighash |
+| `zcash_protocol` | 0.11.0 | Consensus parameters, branch IDs (NU6.3, NU7) |
+| `zcash_address` | 0.14.0 | Unified Address encoding for display |
+| `reddsa` | 0.6 | RedPallas signature verification |
+| `ff` | 0.14 | Finite field traits (alpha serialization) |
+| `zcash_note_encryption` | 0.5 | Open each output's `enc_ciphertext` with `(pk_d, esk)` to recover the memo plaintext for memo-verification |
 | `zeroize` | 1 | Secure memory erasure for sensitive data |
 | `subtle` | 2 | Constant-time cryptographic comparisons |
-| `rand_core` | 0.6 | Fresh attestation challenge nonces (platform CSPRNG) |
+| `rand_core` / `rand` | 0.10 | Platform CSPRNG (`rand::rngs::SysRng`): fresh attestation challenge nonces, and the RNG handed to the `pczt` Prover role |
 | `serialport` | 4 | USB serial (optional, feature `serial`) |
 | `hidapi` | 2 | Ledger USB HID (optional, feature `ledger`) |
 | `thiserror` | 2 | Error type derivation |
@@ -725,14 +743,14 @@ These first landed upstream in commit [`feefa606`](https://github.com/zcash/libr
 - [x] **Network discrimination** — `coin_type` in FvkReq and TxMeta enables mainnet/testnet selection, with device-side validation.
 - [x] **Integration tests** — Virtual HWP device (C/TCP) + 17 end-to-end Rust tests (Orchard + Transparent), running in GitHub Actions on every push.
 - [x] **Transparent digest verification** — Device independently computes transparent txid digest from raw inputs/outputs and refuses to sign on mismatch. Prevents forged transparent digests from compromised companions.
-- [x] **Transparent per-input signing** — Device computes per-input transparent sighash on-device (ZIP-244 S.2: amounts, scripts, txin_sig digests) and signs with ECDSA secp256k1 via BIP-32 derived keys.
+- [ ] **Transparent per-input signing** — withdrawn (November 2026): the device-side per-input sighash was not the ZIP-244 signature hash, so `DeviceSigner` refuses PCZTs with transparent inputs (`TransparentInputsNotSupported`) until the device implements it correctly. Shielded → transparent sends (transparent outputs only) are supported.
 - [x] **Transparent sighash hardening** — Integrated librustzcash PR #2278: `SignableInput::from_parts` validates input index at construction time, preventing out-of-range index attacks.
 - [x] **Sapling-component lockout** — SDK pre-rejects PCZTs with Sapling components; device enforces `sapling_digest == empty-bundle constant`.
 - [x] **NoteCommitment (cmx) verification** — Device recomputes Sinsemilla NoteCommit per action and rejects recipient-substitution attempts. KAT against `librustzcash` Note::commitment().
 - [x] **No-blind-signing invariant (per output)** — Device-side library state machine refuses to sign without explicit per-output user confirmation. Reference port (ESP32) confirms via BOOT button + CDC log; FlipZcash confirms via screen + OK button.
-- [x] **Memo verification via enc_ciphertext recomputation** — SDK recovers each output's memo via the device's OVK and ships it in the memo-verifying wire payload (pool-tagged v6, 1416 B). Device re-encrypts on-chip (Pallas ECDH + Orchard KDF + ChaCha20-Poly1305 RFC 7539, esk derived from rseed+ρ per ZIP-212) and ct-compares against the action's `enc_ciphertext` + `ephemeral_key`. Closes the memo-substitution attack hanh raised.
+- [x] **Memo verification via enc_ciphertext recomputation** — SDK recovers each output's memo from the PCZT and ships it in the memo-verifying wire payload (pool-tagged v6, 1416 B). Device re-encrypts on-chip (Pallas ECDH + Orchard KDF + ChaCha20-Poly1305 RFC 7539, esk derived from rseed+ρ per ZIP-212) and ct-compares against the action's `enc_ciphertext` + `ephemeral_key`. Closes the memo-substitution attack hanh raised.
 - [x] **Miner-fee confirmation invariant** — Device computes the fee on-chip from `t_in − t_out + value_balance` (with overflow + negative detection), renders it on the trusted screen, and refuses to advance `verify()` until the user explicitly approves. Closes the `value_balance`-inflation attack.
-- [x] **Upstream pczt release** — Resolved: the SDK now builds against the published crates.io releases (`pczt 0.8.0-rc.1`, `orchard 0.15.0`); the librustzcash submodule and `[patch.crates-io]` table are no longer required.
+- [x] **Upstream pczt release** — Resolved: the SDK now builds against the published crates.io releases (currently `pczt 0.10.0`, `orchard 0.16.0`); the librustzcash submodule and `[patch.crates-io]` table are no longer required.
 - [x] **Device attestation** — First-pairing identity pinning + per-session RedPallas challenge-response (`pair()` / `attest()` / `new_with_pinned_pubkey`, HWP 0x0F–0x12). Catches device substitution between sessions (audit M1).
 - [ ] **External security audit** — Required before any production/mainnet use
 - [ ] **QR transport testing** — The QR transport is untested with real hardware. Needs end-to-end validation with an air-gapped device.

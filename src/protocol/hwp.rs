@@ -128,9 +128,9 @@ pub enum ErrorCode {
     /// Device-recomputed `cmx` (from claimed recipient/value/rseed) does not
     /// match the action's `cmx` field — recipient-substitution attempt (v4).
     NoteCommitmentMismatch = 0x0D,
-    /// `SIGN_REQ.recipient` decodes to an Orchard receiver that does not
-    /// match any of the per-output recipients the user just confirmed —
-    /// hostile companion lying about the destination (v4).
+    /// Reserved; no longer sent by current firmware (which ignores
+    /// `SIGN_REQ.recipient`). Older firmware: the recipient named in
+    /// SIGN_REQ was not among the reviewed outputs (v4).
     RecipientMismatch = 0x0E,
     /// Device-recomputed `enc_ciphertext` (or epk) does not match the
     /// action's fields — memo-substitution attempt (v5).
@@ -147,6 +147,26 @@ pub enum ErrorCode {
     /// `t_in + value_balance < t_out` — the companion built an unbalanced
     /// bundle (v5).
     FeeNegative = 0x13,
+    /// An action arrived as the compact (no-memo, 904-byte) body. The device
+    /// checks the note ciphertext of every output — zero-value padding
+    /// included — so it only accepts the 1416-byte memo-carrying body.
+    MemoRequired = 0x14,
+    /// The TxMeta consensus branch ID is not in the device firmware's
+    /// allow-list (NU6.3 `0x37a5165b` and NU7 `0x77190ad9` by default).
+    BranchNotAllowed = 0x15,
+    /// The transaction has more actions, transparent outputs or memos than
+    /// the device can review, or carries a memo the device cannot display.
+    LimitExceeded = 0x16,
+    /// An output value, a value balance or a total above MAX_MONEY, or a
+    /// sum that does not fit in 64 bits.
+    ValueOverflow = 0x17,
+    /// The transaction has transparent inputs, or a TRANSPARENT_SIGN_REQ was
+    /// sent: the device does not sign transparent inputs.
+    TransparentInputsUnsupported = 0x18,
+    /// TxMeta declares a non-zero value balance for a shielded pool that has
+    /// no action in the transaction (such a balance is not bound by the
+    /// sighash).
+    EmptyPoolBalance = 0x19,
 }
 
 impl ErrorCode {
@@ -171,6 +191,12 @@ impl ErrorCode {
             0x11 => Self::FeeNotConfirmed,
             0x12 => Self::FeeOverflow,
             0x13 => Self::FeeNegative,
+            0x14 => Self::MemoRequired,
+            0x15 => Self::BranchNotAllowed,
+            0x16 => Self::LimitExceeded,
+            0x17 => Self::ValueOverflow,
+            0x18 => Self::TransparentInputsUnsupported,
+            0x19 => Self::EmptyPoolBalance,
             _ => Self::Unknown,
         }
     }
@@ -327,11 +353,14 @@ impl<T: Transport> HwpCodec<T> {
     ///
     /// Audit: docs/security-audit/04-host-sdk-rust.md M1.
     pub fn attest(&mut self, pinned_pubkey: &[u8; 32]) -> Result<()> {
-        use rand_core::{OsRng, RngCore};
+        use rand_core::{Rng, UnwrapErr};
         use subtle::ConstantTimeEq;
 
+        // rand_core 0.10: the OS CSPRNG is `rand::rngs::SysRng` (fallible);
+        // `UnwrapErr` turns an OS RNG failure into a panic rather than a
+        // predictable challenge.
         let mut challenge = [0u8; 32];
-        OsRng.fill_bytes(&mut challenge);
+        UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut challenge);
 
         let seq = self.next_seq();
         self.write_frame(seq, MsgType::AttestReq, &challenge)?;
@@ -556,83 +585,6 @@ impl<T: Transport> HwpCodec<T> {
                 other => {
                     return Err(HwSignerError::ProtocolError(format!(
                         "Expected TX_OUTPUT_ACK, got {:?}",
-                        other
-                    )));
-                }
-            }
-        }
-    }
-
-    /// Send a transparent signing request to the device (v3).
-    ///
-    /// The device computes the per-input sighash on-device from its stored
-    /// transparent state + the input data, then signs with ECDSA secp256k1.
-    ///
-    /// # Payload format
-    /// `[input_index:2 LE][total_inputs:2 LE][input_data:N]`
-    ///
-    /// # Response
-    /// `[der_sig_len:1][der_sig:N][sighash_type:1][pubkey:33]`
-    pub fn sign_transparent(
-        &mut self,
-        input_index: u16,
-        total_inputs: u16,
-        input_data: &[u8],
-    ) -> Result<crate::types::TransparentSignResponse> {
-        let mut payload = Vec::with_capacity(4 + input_data.len());
-        payload.extend_from_slice(&input_index.to_le_bytes());
-        payload.extend_from_slice(&total_inputs.to_le_bytes());
-        payload.extend_from_slice(input_data);
-        let seq = self.next_seq();
-        self.write_frame(seq, MsgType::TransparentSignReq, &payload)?;
-
-        let mut keepalive_count = 0usize;
-        loop {
-            let frame = self.read_frame()?;
-            match frame.msg_type {
-                MsgType::Ping => {
-                    keepalive_count += 1;
-                    if keepalive_count > HWP_MAX_KEEPALIVE {
-                        return Err(HwSignerError::MaxKeepaliveExceeded {
-                            max: HWP_MAX_KEEPALIVE,
-                        });
-                    }
-                    self.write_frame(frame.seq, MsgType::Pong, &[])?;
-                    continue;
-                }
-                MsgType::TransparentSignRsp => {
-                    // Parse: der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33]
-                    if frame.payload.is_empty() {
-                        return Err(HwSignerError::ProtocolError(
-                            "TRANSPARENT_SIGN_RSP empty".into(),
-                        ));
-                    }
-                    let der_len = frame.payload[0] as usize;
-                    let min_len = 1 + der_len + 1 + 33;
-                    if frame.payload.len() < min_len {
-                        return Err(HwSignerError::ProtocolError(format!(
-                            "TRANSPARENT_SIGN_RSP too short: {} < {}",
-                            frame.payload.len(),
-                            min_len
-                        )));
-                    }
-                    let mut sig = Vec::with_capacity(der_len + 1);
-                    sig.extend_from_slice(&frame.payload[1..1 + der_len]);
-                    let sighash_type = frame.payload[1 + der_len];
-                    sig.push(sighash_type);
-
-                    let mut pubkey = [0u8; 33];
-                    pubkey.copy_from_slice(&frame.payload[1 + der_len + 1..1 + der_len + 1 + 33]);
-
-                    return Ok(crate::types::TransparentSignResponse { signature: sig, pubkey });
-                }
-                MsgType::Error => {
-                    let (code, msg) = parse_error(&frame.payload);
-                    return Err(device_error(code, &msg));
-                }
-                other => {
-                    return Err(HwSignerError::ProtocolError(format!(
-                        "Expected TRANSPARENT_SIGN_RSP, got {:?}",
                         other
                     )));
                 }
@@ -961,7 +913,36 @@ fn device_error(code: ErrorCode, msg: &str) -> HwSignerError {
                 msg.to_string()
             },
         },
+        // Device-side rules of the November 2026 firmware API.
+        ErrorCode::MemoRequired => HwSignerError::MemoRequired {
+            reason: device_reason(msg),
+        },
+        ErrorCode::BranchNotAllowed => HwSignerError::BranchNotAllowed {
+            reason: device_reason(msg),
+        },
+        ErrorCode::LimitExceeded => HwSignerError::DeviceLimitExceeded {
+            reason: device_reason(msg),
+        },
+        ErrorCode::ValueOverflow => HwSignerError::ValueOverflow {
+            reason: device_reason(msg),
+        },
+        // The device does not say how many inputs: 0 = "not known here".
+        ErrorCode::TransparentInputsUnsupported => {
+            HwSignerError::TransparentInputsNotSupported { inputs: 0 }
+        }
+        ErrorCode::EmptyPoolBalance => HwSignerError::EmptyPoolBalance {
+            reason: device_reason(msg),
+        },
         _ => HwSignerError::DeviceError(format!("{:?}: {}", code, msg)),
+    }
+}
+
+/// The device's own message text, or a placeholder when it sent none.
+fn device_reason(msg: &str) -> String {
+    if msg.is_empty() {
+        "no detail from device".into()
+    } else {
+        msg.to_string()
     }
 }
 

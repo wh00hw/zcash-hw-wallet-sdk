@@ -81,8 +81,7 @@ pub use signer::DeviceSigner;
 pub use traits::HardwareSigner;
 pub use types::{
     ActionData, ExportedFvk, SignRequest, SignResponse, SigningResult,
-    TransparentInputData, TransparentOutputData, TransparentSignRequest,
-    TransparentSignResponse, TxDetails, TxMeta,
+    TransparentInputData, TransparentOutputData, TxDetails, TxMeta,
 };
 pub use workflow::PcztHardwareSigning;
 

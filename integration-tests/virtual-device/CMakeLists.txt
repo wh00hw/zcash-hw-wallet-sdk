@@ -29,7 +29,12 @@ add_executable(virtual-device
 
 # libzcash-ironwood-c >= d2af85a renamed the CMake target from
 # zcash-orchard-c to zcash-ironwood-c.
-target_link_libraries(virtual-device PRIVATE zcash-ironwood-c)
+# The control port (test side channel) is served from its own thread.
+find_package(Threads REQUIRED)
+target_link_libraries(virtual-device PRIVATE zcash-ironwood-c Threads::Threads)
+# POSIX sockets, sigaction, clock_gettime, nanosleep — for the fixture's own
+# sources only; the library is compiled exactly as its own build does.
+target_compile_definitions(virtual-device PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
 
 target_include_directories(virtual-device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

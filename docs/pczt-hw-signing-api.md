@@ -2,7 +2,7 @@
 
 ## Summary
 
-The `zcash-hw-wallet-sdk` demonstrates that the PCZT external signing APIs published in the `pczt` crate (0.8.0-rc.1) are sufficient for complete hardware wallet integration — no additional changes to upstream crates are needed.
+The `zcash-hw-wallet-sdk` demonstrates that the PCZT external signing APIs published in the `pczt` crate (currently built against 0.10.0) are sufficient for complete hardware wallet integration — no additional changes to upstream crates are needed.
 
 This document describes which APIs are used and how they enable the hardware wallet signing workflow.
 
@@ -67,13 +67,13 @@ Using only upstream APIs, the SDK implements this workflow:
 
 ```
 1. Parse PCZT                     Pczt::parse()
-2. Extract TxMeta                 Pczt::into_effects() + TxIdDigester
-3. Validate network               BranchId::try_from(consensus_branch_id)
-4. Generate Orchard proof          Prover::new() + create_orchard_proof()
-5. Initialize Signer              Signer::new() — computes sighash
-6. Read sighash                   signer.shielded_sighash()
-7. Read action data                low_level_signer::sign_orchard_with()
-                                   + sign_ironwood_with() (NU6.3 pool)
+2. Validate branch / version       pczt.global() — NU6.3 or NU7, v6 only
+3. Extract TxMeta                 Pczt::into_effects() + TxIdDigester
+4. Read action data                low_level_signer::sign_orchard_with()
+                                   + sign_ironwood_with() (Ironwood pool)
+5. Generate Orchard proof          Prover::new() + create_orchard_proof()
+6. Initialize Signer              Signer::new() — computes sighash
+7. Read sighash                   signer.shielded_sighash()
 8. Send to device for ZIP-244      HWP TX_OUTPUT messages
    sighash verification
 9. Sign on device                  HWP SIGN_REQ/SIGN_RSP
@@ -90,10 +90,19 @@ No shadow deserialization, no `pub(crate)` workarounds, no patched crates.
 The external-signing APIs shipped on crates.io starting with `pczt` 0.6.0.
 The **Ironwood (NU6.3) PCZT v2 support** — the `ironwood` bundle field,
 `sign_ironwood_with`, `apply_ironwood_signature`, `create_ironwood_proof`,
-and the v6 sighash plumbing — shipped with **`pczt` 0.8.0-rc.1**, alongside
-the matching `orchard 0.15.0`, `zcash_primitives 0.29.0`, and
-`zcash_protocol 0.10.0` releases of the NU6.3 activation stack (mainnet
-~2026-07-21).
+and the v6 sighash plumbing — first shipped with `pczt` 0.8 as part of the
+NU6.3 activation stack (mainnet ~2026-07-21). Those versions are history:
+the SDK no longer builds against them.
+
+The SDK currently builds against the **NU7 release set** of 2026-10-21 —
+`pczt 0.10.0`, `orchard 0.16.0`, `zcash_primitives 0.31.0`,
+`zcash_protocol 0.11.0` (NU7 branch ID `0x77190AD9`; mainnet activation
+height 3,543,405, testnet 4,465,026). NU7 keeps the v6 transaction format
+and the ZIP-244 digest structure, so the flow above is unchanged; the only
+API differences are that the `pczt` Prover / IO Finalizer / Extractor roles
+now take an explicit RNG argument (`rand_core 0.10`), and that
+`zcash_primitives`' `TxDigests` became `Zip244Digests` with accessor
+methods.
 
 The SDK builds against those published releases directly: no
 `[patch.crates-io]` table and no librustzcash git checkout are required.

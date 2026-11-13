@@ -143,8 +143,12 @@ impl ExportedFvk {
                 "Invalid Orchard FVK bytes from device".to_string(),
             ))?;
 
+        // ZIP 316 Revision 0 container (`uview` / `uviewtest` HRP): the
+        // encoding earlier SDK versions produced (zcash_address < 0.14 had
+        // no notion of revisions), so existing paired wallets keep matching.
         let ufvk = unified::Ufvk::try_from_items(
-            vec![unified::Fvk::Orchard(fvk_bytes)]
+            unified::Revision::R0,
+            vec![unified::Uitem::Data(unified::Fvk::Orchard(fvk_bytes))],
         ).map_err(|e| crate::error::HwSignerError::DeviceError(
             format!("UFVK encoding failed: {}", e),
         ))?;
@@ -189,7 +193,8 @@ impl ShieldedPoolKind {
 /// `pool_tag(1) || cv_net(32) || nullifier(32) || rk(32) || cmx(32) ||
 ///   ephemeral_key(32) || enc_ciphertext(580) || out_ciphertext(80) ||
 ///   recipient(43) || value(8 LE) || rseed(32) [|| memo(512)]`
-/// Total: 904 bytes (compact, cmx-only) or 1416 bytes (memo-verifying).
+/// Total: 1416 bytes with the memo — the only form the device accepts — or
+/// 904 bytes without it (compact; refused by current firmware for every output).
 ///
 /// The recipient/value/rseed trailer is the unencrypted note plaintext.
 /// They are required so the device can recompute the action's NoteCommitment and
@@ -224,11 +229,12 @@ pub struct ActionData {
     pub rseed: [u8; 32],
     /// Output-note memo plaintext (ZIP-302 conventions, 512 bytes).
     ///
-    /// Populated when the workflow has recovered it from `out_ciphertext` via
-    /// the sender's outgoing viewing key. `None` for outputs sent with
-    /// `OVK::None` (deliberately unrecoverable by the sender) — in that case
-    /// the memo-verifying wire format is not used for this action and the
-    /// device falls back to cmx-only verification.
+    /// The workflow always sets it: it rebuilds the note from the PCZT's
+    /// `(recipient, value, rseed)` and the action's rho and opens
+    /// `enc_ciphertext` with `(pk_d, esk)`, for every output including
+    /// zero-value padding (and fails with `OutputNotRecoverable` otherwise).
+    /// `None` selects the compact wire form, which current device firmware
+    /// refuses for every output (`MemoRequired`).
     pub memo: Option<[u8; 512]>,
 }
 
@@ -260,11 +266,11 @@ impl ActionData {
 
     /// Serialize to the v6 wire format for TxOutput messages: a 1-byte pool
     /// tag (`0x00` Orchard, `0x01` Ironwood) followed by the memo-verifying
-    /// payload (903-byte body + memo[512], 1416 bytes total) or, when the
-    /// memo is unavailable, the cmx-only body (904 bytes total). esk is
-    /// never transmitted — the device derives it from (rseed, rho). This is
-    /// the only action wire format this host emits; the device strips the
-    /// pool tag and discriminates the format by the remaining payload size.
+    /// payload (903-byte body + memo[512], 1416 bytes total) — or, with
+    /// `memo: None`, the compact body (904 bytes total), which current
+    /// device firmware refuses. esk is never transmitted — the device
+    /// derives it from (rseed, rho). This is the only action wire format
+    /// this host emits.
     pub fn serialize_v6(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(1 + 903 + 512);
         buf.push(self.pool.to_byte());
@@ -410,86 +416,87 @@ impl TxMeta {
         buf
     }
 
-    /// Extract TxMeta from a parsed PCZT.
+    /// Derive the TxMeta the device needs from a PCZT.
     ///
-    /// Reads the global header fields and Orchard bundle metadata.
-    /// The transparent_sig_digest and sapling_digest are extracted from the
-    /// TxDigests computed during proof generation (set via set_digests).
-    pub fn from_pczt(pczt: &pczt::Pczt) -> Self {
-        let global = pczt.global();
+    /// This is the one place the 170-byte v6 metadata is derived; the
+    /// signing workflow calls it. The header fields come from the
+    /// transaction *effects* (`Pczt::into_effects`), not from the PCZT
+    /// globals: the effects carry the real header word (`0x80000006`, with
+    /// the overwintered bit, where the global `tx_version` is the bare `6`)
+    /// and the lock time `zcash_primitives` will actually hash.
+    /// `transparent_sig_digest` and `sapling_digest` are taken from the
+    /// ZIP-244 digests of the same effects.
+    ///
+    /// Returns [`HwSignerError::InvalidPczt`] if the effects cannot be
+    /// extracted (unknown consensus branch ID, a branch/version pair that
+    /// does not exist, malformed bundles) or a value balance does not fit
+    /// the wire format.
+    ///
+    /// [`HwSignerError::InvalidPczt`]: crate::error::HwSignerError::InvalidPczt
+    pub fn from_pczt(pczt: &pczt::Pczt, coin_type: u32) -> crate::error::Result<Self> {
+        use crate::error::HwSignerError;
+        use zcash_primitives::transaction::txid::TxIdDigester;
+
+        fn digest32(h: blake2b_simd::Hash) -> [u8; 32] {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&h.as_bytes()[..32]);
+            out
+        }
+        fn empty_digest(personal: &[u8; 16]) -> blake2b_simd::State {
+            blake2b_simd::Params::new()
+                .hash_length(32)
+                .personal(personal)
+                .to_state()
+        }
+        fn signed_value_sum(vs: &(u64, bool), what: &str) -> crate::error::Result<i64> {
+            let (magnitude, is_negative) = *vs;
+            let magnitude = i64::try_from(magnitude).map_err(|_| {
+                HwSignerError::InvalidPczt(format!("{} value balance out of range", what))
+            })?;
+            Ok(if is_negative { -magnitude } else { magnitude })
+        }
+
+        let tx_data = pczt.clone().into_effects().map_err(|e| {
+            HwSignerError::InvalidPczt(format!("cannot extract transaction effects: {:?}", e))
+        })?;
+        let txid_parts = tx_data.digest(TxIdDigester);
+
+        let transparent_sig_digest = {
+            let mut h = empty_digest(b"ZTxIdTranspaHash");
+            if let Some(td) = txid_parts.transparent_digests() {
+                h.update(td.prevouts_digest.as_bytes());
+                h.update(td.sequence_digest.as_bytes());
+                h.update(td.outputs_digest.as_bytes());
+            }
+            digest32(h.finalize())
+        };
+        let sapling_digest = match txid_parts.sapling_digest() {
+            Some(d) => digest32(*d),
+            None => digest32(empty_digest(b"ZTxIdSaplingHash").finalize()),
+        };
+
         let orchard = pczt.orchard();
         let ironwood = pczt.ironwood();
-        let signed_value_sum = |vs: &(u64, bool)| -> i64 {
-            let (magnitude, is_negative) = vs;
-            if *is_negative {
-                -(*magnitude as i64)
-            } else {
-                *magnitude as i64
-            }
-        };
-        Self {
-            version: *global.tx_version(),
-            version_group_id: *global.version_group_id(),
-            consensus_branch_id: *global.consensus_branch_id(),
-            lock_time: 0,
-            expiry_height: *global.expiry_height(),
+        Ok(Self {
+            version: tx_data.version().header(),
+            version_group_id: tx_data.version().version_group_id(),
+            consensus_branch_id: u32::from(tx_data.consensus_branch_id()),
+            lock_time: tx_data.lock_time(),
+            expiry_height: u32::from(tx_data.expiry_height()),
             orchard_flags: *orchard.flags(),
-            value_balance: signed_value_sum(orchard.value_sum()),
-            // librustzcash 292e7584: PCZT bundles carry deferred (Option)
-            // anchors across roles. Absent here means the anchor is not yet
-            // populated — fall back to the empty value (the workflow
-            // recomputes the authoritative sighash from the tx effects).
+            value_balance: signed_value_sum(orchard.value_sum(), "Orchard")?,
+            // PCZT anchors are deferred (Option). Under v6 the anchors are
+            // not part of the effects digest; an absent one is sent as
+            // zeroes.
             anchor: (*orchard.anchor()).unwrap_or([0u8; 32]),
             ironwood_flags: *ironwood.flags(),
-            ironwood_value_balance: signed_value_sum(ironwood.value_sum()),
+            ironwood_value_balance: signed_value_sum(ironwood.value_sum(), "Ironwood")?,
             ironwood_anchor: (*ironwood.anchor()).unwrap_or([0u8; 32]),
-            // These will be filled in by the workflow from the TxDigests
-            transparent_sig_digest: [0u8; 32],
-            sapling_digest: [0u8; 32],
-            // Set by the workflow based on the target network
-            coin_type: 0,
-        }
+            transparent_sig_digest,
+            sapling_digest,
+            coin_type,
+        })
     }
-
-    /// Set the pre-computed digests from the signer's TxDigests.
-    pub fn set_digests(&mut self, transparent_sig_digest: [u8; 32], sapling_digest: [u8; 32]) {
-        self.transparent_sig_digest = transparent_sig_digest;
-        self.sapling_digest = sapling_digest;
-    }
-}
-
-/// Request sent to a hardware device for signing a single transparent input.
-///
-/// Unlike Orchard/Sapling (shared shielded sighash), transparent has a
-/// **per-input sighash** — each input commits to its own script and value.
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
-pub struct TransparentSignRequest {
-    /// The ZIP-244 per-input sighash (32 bytes).
-    pub sighash: [u8; 32],
-
-    /// Zero-based index of this input within the transparent bundle.
-    pub input_index: usize,
-
-    /// Total number of transparent inputs requiring signatures.
-    pub total_inputs: usize,
-
-    /// Value of the UTXO being spent in zatoshis (for device display).
-    pub value: u64,
-
-    /// The scriptPubKey of the UTXO being spent (for device display/validation).
-    pub script_pubkey: Vec<u8>,
-}
-
-/// Response from a hardware device after signing a transparent input.
-///
-/// Contains a DER-encoded ECDSA signature and the compressed public key.
-#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
-pub struct TransparentSignResponse {
-    /// DER-encoded ECDSA signature with appended sighash_type byte.
-    pub signature: Vec<u8>,
-
-    /// Compressed secp256k1 public key (33 bytes).
-    pub pubkey: [u8; 33],
 }
 
 /// Outcome of a completed hardware signing workflow.

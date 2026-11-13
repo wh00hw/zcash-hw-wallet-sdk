@@ -13,7 +13,7 @@ use crate::error::{HwSignerError, Result};
 use crate::traits::HardwareSigner;
 use crate::types::{
     ActionData, ShieldedPoolKind, SignRequest, SigningResult, TransparentInputData,
-    TransparentOutputData, TransparentSignRequest, TxDetails, TxMeta,
+    TransparentOutputData, TxDetails, TxMeta,
 };
 use crate::verify;
 
@@ -22,13 +22,75 @@ use tracing::{debug, info};
 use zcash_protocol::consensus::{BranchId, OrchardProtocolRevision};
 use zeroize::Zeroize;
 
-/// Pre-proof v6-only gate (post-NU6.3 host).
+/// Consensus branch IDs this host signs for: NU6.3 (`0x37a5165b`) and NU7
+/// (`0x77190ad9`).
 ///
-/// Rejects any transaction whose consensus branch ID predates NU6.3
-/// (`0x37a5165b`) or whose version header is not v6 (`0x80000006`), before
-/// any expensive Halo2 work. Mirrors the strict device, which enforces the
-/// same constants at `feed_meta` time — failing here saves a device
-/// round-trip that would end in `Error(BAD_META)`.
+/// This is an explicit allow-list rather than a "NU6.3 or later" comparison
+/// on purpose. The device recomputes the ZIP-244 v6 five-leaf sighash
+/// on-chip from the streamed transaction, with the branch ID only entering
+/// the header digest and the root personalization. That is exactly the
+/// transaction digest structure `zcash_primitives 0.31` uses for a v6
+/// transaction under both of these branches (NU7 changed the block target
+/// spacing and the default expiry delta, not the v6 format, the digest
+/// personalizations or the Orchard protocol revision). A future upgrade that
+/// touches any of those must be reviewed against the device firmware before
+/// its branch ID is added here.
+pub(crate) const SUPPORTED_BRANCH_IDS: [BranchId; 2] = [BranchId::Nu6_3, BranchId::Nu7];
+
+/// The bare v6 transaction version number and version group ID, as carried
+/// in the PCZT globals (the header word adds the overwintered bit).
+const V6_TX_VERSION_NUMBER: u32 = 6;
+const V6_VERSION_GROUP_ID: u32 = 0xD884_B698;
+
+/// Branch check against an explicit allow-list.
+///
+/// * not a consensus branch ID at all, or a pre-Orchard one →
+///   [`HwSignerError::NetworkMismatch`];
+/// * an Orchard-era branch older than NU6.3 → [`HwSignerError::UnsupportedPool`];
+/// * anything not in `supported` (e.g. a future branch) →
+///   [`HwSignerError::UnsupportedPool`].
+///
+/// `supported` is a parameter so that the allow-list itself is testable;
+/// production code passes [`SUPPORTED_BRANCH_IDS`].
+pub(crate) fn check_branch(
+    consensus_branch_id: u32,
+    coin_type: u32,
+    supported: &[BranchId],
+) -> Result<BranchId> {
+    let mismatch = HwSignerError::NetworkMismatch {
+        expected: coin_type,
+        got: consensus_branch_id,
+    };
+    let Ok(branch_id) = BranchId::try_from(consensus_branch_id) else {
+        return Err(mismatch);
+    };
+    let Some(orchard_revision) = branch_id.orchard_protocol_revision() else {
+        return Err(mismatch);
+    };
+    if orchard_revision < OrchardProtocolRevision::V3 {
+        return Err(HwSignerError::UnsupportedPool(
+            "pre-NU6.3 consensus branch ID: this v6-only host signs NU6.3 and NU7 transactions exclusively",
+        ));
+    }
+    // Every supported branch must also select Orchard protocol revision V3
+    // (the post-NU6.3 circuit the prover builds). A branch this SDK was not
+    // reviewed against is refused rather than signed blind.
+    if !supported.contains(&branch_id) || orchard_revision != OrchardProtocolRevision::V3 {
+        return Err(HwSignerError::UnsupportedPool(
+            "consensus branch ID is not one this host supports (NU6.3 and NU7 only)",
+        ));
+    }
+    Ok(branch_id)
+}
+
+/// Pre-proof v6-only gate (NU6.3 / NU7 host) on the transaction header.
+///
+/// Rejects any transaction whose consensus branch ID is not NU6.3
+/// (`0x37a5165b`) or NU7 (`0x77190ad9`), or whose version header is not v6
+/// (`0x80000006`), before any expensive Halo2 work. The strict device
+/// enforces the v6 header constants at `feed_meta` time — failing here saves
+/// a device round-trip that would end in `Error(BAD_META)` — and binds the
+/// branch ID through the sighash it recomputes.
 ///
 /// `coin_type` is only used to populate the [`HwSignerError::NetworkMismatch`]
 /// error for branch IDs that are not valid consensus branches at all.
@@ -37,26 +99,30 @@ pub(crate) fn ensure_v6_only(
     consensus_branch_id: u32,
     coin_type: u32,
 ) -> Result<()> {
-    let branch_id = BranchId::try_from(consensus_branch_id).map_err(|_| {
-        HwSignerError::NetworkMismatch {
-            expected: coin_type,
-            got: consensus_branch_id,
-        }
-    })?;
-    let orchard_revision = branch_id.orchard_protocol_revision().ok_or({
-        HwSignerError::NetworkMismatch {
-            expected: coin_type,
-            got: consensus_branch_id,
-        }
-    })?;
-    if orchard_revision < OrchardProtocolRevision::V3 {
-        return Err(HwSignerError::UnsupportedPool(
-            "pre-NU6.3 consensus branch ID: this v6-only host signs NU6.3+ transactions exclusively",
-        ));
-    }
+    check_branch(consensus_branch_id, coin_type, &SUPPORTED_BRANCH_IDS)?;
     if tx_version_header != crate::types::V6_TX_VERSION {
         return Err(HwSignerError::UnsupportedPool(
-            "transaction version is not v6: this v6-only host emits only the NU6.3 wire tier",
+            "transaction version is not v6: this v6-only host emits only the v6 (NU6.3 / NU7) wire tier",
+        ));
+    }
+    Ok(())
+}
+
+/// The same gate, applied to the raw PCZT globals *before* the transaction
+/// effects are extracted. `Pczt::into_effects` itself fails on an unknown
+/// branch ID or a branch/version pair that does not exist, so this is what
+/// turns a foreign PCZT into the specific typed error instead of a generic
+/// extraction failure.
+pub(crate) fn ensure_v6_globals(
+    tx_version: u32,
+    version_group_id: u32,
+    consensus_branch_id: u32,
+    coin_type: u32,
+) -> Result<()> {
+    check_branch(consensus_branch_id, coin_type, &SUPPORTED_BRANCH_IDS)?;
+    if tx_version != V6_TX_VERSION_NUMBER || version_group_id != V6_VERSION_GROUP_ID {
+        return Err(HwSignerError::UnsupportedPool(
+            "transaction version is not v6: this v6-only host emits only the v6 (NU6.3 / NU7) wire tier",
         ));
     }
     Ok(())
@@ -126,27 +192,35 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
         self.sign_with_details(pczt_bytes, None)
     }
 
-    /// Sign a PCZT with optional transaction details for device confirmation.
+    /// Sign a PCZT, with optional transaction details.
     ///
-    /// If `details` is provided, the device's `confirm_transaction` method
-    /// is called before signing begins. This allows the user to verify
-    /// the transaction on the device screen.
+    /// If `details` is provided, the signer's `confirm_transaction` hook is
+    /// called before signing begins, and the details are copied into
+    /// `SIGN_REQ`. They are NOT what the user approves on an HWP device:
+    /// the device ignores the recipient, amount and fee of `SIGN_REQ` and
+    /// shows only what it verified and computed itself (each output with
+    /// the ownership it decided, the totals). `sign(pczt)` — no details,
+    /// empty recipient — is therefore equivalent as far as the device is
+    /// concerned.
     pub fn sign_with_details(
         &mut self,
         pczt_bytes: Vec<u8>,
         details: Option<TxDetails>,
     ) -> Result<SigningResult> {
-        // Step 0: Defense-in-depth Orchard-only invariant check.
+        // Step 0: Parse the PCZT once. Everything below works on this value;
+        // nothing in the signing path unwraps caller-supplied data.
+        let pczt = pczt::Pczt::parse(&pczt_bytes)
+            .map_err(|e| HwSignerError::InvalidPczt(format!("parse: {:?}", e)))?;
+        let coin_type = self.signer.coin_type();
+
+        // Defense-in-depth Orchard-only invariant check.
         //
         // The device enforces that sapling_digest equals the ZIP-244 empty-bundle
         // constant before signing (SIGNER_ERR_SAPLING_NOT_EMPTY). Reject locally
         // first so the user gets a clean error instead of round-tripping a PCZT
-        // that the device will reject. Mirrors the on-device invariant: this
-        // signer never produces a transaction with any Sapling component.
+        // that the device will reject.
         {
-            let pczt_for_check = pczt::Pczt::parse(&pczt_bytes)
-                .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT parse: {:?}", e)))?;
-            let sapling = pczt_for_check.sapling();
+            let sapling = pczt.sapling();
             let n_spends = sapling.spends().len();
             let n_outputs = sapling.outputs().len();
             if n_spends != 0 || n_outputs != 0 {
@@ -157,159 +231,57 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             }
         }
 
-        // Step 1: Extract tx metadata for device verification
-        // Extract TxMeta from the actual TransactionData (not from PCZT Global)
-        // to ensure fields like lock_time match what zcash_primitives uses.
-        let tx_meta = {
-            use zcash_primitives::transaction::txid::TxIdDigester;
-
-            let pczt_clone = pczt::Pczt::parse(&pczt_bytes).unwrap();
-            let tx_data = pczt_clone.into_effects()
-                .expect("PCZT effects extraction failed");
-            let txid_parts = tx_data.digest(TxIdDigester);
-
-            // transparent_sig_digest from txid parts
-            let transparent_sig_digest = {
-                let mut h = blake2b_simd::Params::new()
-                    .hash_length(32).personal(b"ZTxIdTranspaHash").to_state();
-                if let Some(ref td) = txid_parts.transparent_digests {
-                    h.update(td.prevouts_digest.as_bytes());
-                    h.update(td.sequence_digest.as_bytes());
-                    h.update(td.outputs_digest.as_bytes());
-                }
-                <[u8; 32]>::try_from(h.finalize().as_bytes()).unwrap()
-            };
-
-            // sapling_digest
-            let sapling_digest = match txid_parts.sapling_digest {
-                Some(d) => <[u8; 32]>::try_from(d.as_bytes()).unwrap(),
-                None => {
-                    let h = blake2b_simd::Params::new()
-                        .hash_length(32).personal(b"ZTxIdSaplingHash")
-                        .to_state().finalize();
-                    <[u8; 32]>::try_from(h.as_bytes()).unwrap()
-                }
-            };
-
-            debug!("header_digest: {}", hex::encode(txid_parts.header_digest.as_bytes()));
-            debug!("transparent_sig_digest: {}", hex::encode(transparent_sig_digest));
-            debug!("sapling_digest: {}", hex::encode(sapling_digest));
-            if let Some(ref od) = txid_parts.orchard_digest {
-                debug!("orchard_digest: {}", hex::encode(od.as_bytes()));
-            }
-
-            // Build TxMeta from TransactionData fields
-            let shielded = pczt::Pczt::parse(&pczt_bytes).unwrap();
-            let orchard_bundle = shielded.orchard();
-            let ironwood_bundle = shielded.ironwood();
-            let signed_value_sum = |vs: &(u64, bool)| -> i64 {
-                let (magnitude, is_negative) = vs;
-                if *is_negative {
-                    -(*magnitude as i64)
-                } else {
-                    *magnitude as i64
-                }
-            };
-
-            TxMeta {
-                version: tx_data.version().header(),
-                version_group_id: tx_data.version().version_group_id(),
-                consensus_branch_id: u32::from(tx_data.consensus_branch_id()),
-                lock_time: tx_data.lock_time(),
-                expiry_height: u32::from(tx_data.expiry_height()),
-                orchard_flags: *orchard_bundle.flags(),
-                value_balance: signed_value_sum(orchard_bundle.value_sum()),
-                // librustzcash 292e7584: PCZT anchors are deferred (Option).
-                // At signing time the bundle being signed has a populated
-                // anchor; an absent one for a non-empty bundle is a malformed
-                // PCZT. Empty bundles legitimately carry no anchor.
-                anchor: (*orchard_bundle.anchor()).unwrap_or([0u8; 32]),
-                ironwood_flags: *ironwood_bundle.flags(),
-                ironwood_value_balance: signed_value_sum(ironwood_bundle.value_sum()),
-                ironwood_anchor: (*ironwood_bundle.anchor()).unwrap_or([0u8; 32]),
-                transparent_sig_digest,
-                sapling_digest,
-                coin_type: self.signer.coin_type(),
-            }
-        };
-
-        // Validate the transaction is post-NU6.3 v6 BEFORE expensive proof
-        // generation. This host is v6-only: any pre-NU6.3 consensus branch
-        // ID or non-v6 transaction version is rejected outright — the
-        // legacy v5 code path no longer exists.
-        ensure_v6_only(
-            tx_meta.version,
-            tx_meta.consensus_branch_id,
-            self.signer.coin_type(),
-        )?;
-
-        info!("PCZT parsed (v{}, branch_id=0x{:08x}, {:?}, lock_time={}).",
-              tx_meta.version, tx_meta.consensus_branch_id, tx_meta.coin_type, tx_meta.lock_time);
-
-        info!("Running Orchard-protocol prover...");
-
-        // Step 2: Generate the Halo2 proof(s). v6-only: NU6.3 is guaranteed
-        // by the check above, so both the sealed Orchard pool and the
-        // Ironwood pool use the post-NU6.3 circuit (the one that enforces
-        // the cross-address restriction public input) — one proving key
-        // serves both bundles.
-        use orchard::circuit::OrchardCircuitVersion;
-
-        let pczt_for_prover = pczt::Pczt::parse(&pczt_bytes)
-            .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse: {:?}", e)))?;
-        let mut prover = pczt::roles::prover::Prover::new(pczt_for_prover);
-        let need_orchard_proof = prover.requires_orchard_proof();
-        let need_ironwood_proof = prover.requires_ironwood_proof();
-        if need_orchard_proof || need_ironwood_proof {
-            let pk = orchard::circuit::ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
-            if need_orchard_proof {
-                prover = prover
-                    .create_orchard_proof(&pk)
-                    .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
-            }
-            if need_ironwood_proof {
-                prover = prover
-                    .create_ironwood_proof(&pk)
-                    .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
+        // Transparent inputs are not supported: the device refuses them
+        // (HWP 0x18) and this workflow has no transparent signing path.
+        // Refuse here, with a typed error, before any proof work and before
+        // anything is sent to the device. Transparent OUTPUTS (shielded ->
+        // t-address) are supported.
+        {
+            let n_t_inputs = pczt.transparent().inputs().len();
+            if n_t_inputs != 0 {
+                return Err(HwSignerError::TransparentInputsNotSupported { inputs: n_t_inputs });
             }
         }
-        let proven_pczt = prover.finish();
 
-        info!("Orchard proof generated. Initializing signer...");
+        // Step 1: v6 / branch gate on the PCZT globals, BEFORE the effects
+        // are extracted and before any proof work: a PCZT for another
+        // branch, another transaction version, or no known branch at all is
+        // refused with its specific error here.
+        {
+            let global = pczt.global();
+            ensure_v6_globals(
+                *global.tx_version(),
+                *global.version_group_id(),
+                *global.consensus_branch_id(),
+                coin_type,
+            )?;
+        }
 
-        // Step 3: Initialize Signer role and extract sighash
-        let mut signer_role = pczt::roles::signer::Signer::new(proven_pczt)
-            .map_err(|e| HwSignerError::SignerInitFailed(format!("{:?}", e)))?;
+        // Step 2: Derive the tx metadata the device verifies, from the
+        // transaction effects (single source of truth: TxMeta::from_pczt),
+        // and re-check the header actually derived.
+        let tx_meta = TxMeta::from_pczt(&pczt, coin_type)?;
+        ensure_v6_only(tx_meta.version, tx_meta.consensus_branch_id, coin_type)?;
 
-        let mut sighash = signer_role.shielded_sighash();
-        info!("Sighash: {}...", hex::encode(&sighash[..8]));
+        info!(
+            "PCZT parsed (version=0x{:08x}, branch_id=0x{:08x}, coin_type={}, lock_time={}).",
+            tx_meta.version, tx_meta.consensus_branch_id, tx_meta.coin_type, tx_meta.lock_time
+        );
 
-        // Step 4: Read action data from the Orchard bundle via the Signer.
-        // The upstream pczt Signer exposes the orchard bundle through
-        // sign_orchard / apply_orchard_signature. We read action data
-        // from the Pczt directly (before it was consumed by the Signer).
-        let pre_pczt = pczt::Pczt::parse(&pczt_bytes)
-            .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse: {:?}", e)))?;
-
-        // Fetch the device's Orchard OVK for memo recovery. We use the
-        // sender's OutgoingViewingKey to trial-decrypt out_ciphertext on
-        // each action, which recovers the unencrypted note plaintext
-        // (including memo) that we then forward to the device so it can
-        // verify enc_ciphertext byte-for-byte. If the device cannot supply
-        // an FVK we proceed without — the workflow falls back to v4
-        // cmx-only verification for actions whose memo we can't recover.
-        let ovk_for_recovery: Option<orchard::keys::OutgoingViewingKey> =
-            match self.signer.export_fvk() {
-                Ok(fvk) => fvk
-                    .to_orchard_fvk()
-                    .map(|f| f.to_ovk(orchard::keys::Scope::External)),
-                Err(_) => None,
-            };
+        // Step 3: Read action data from the PCZT (before proving: a PCZT the
+        // host cannot fully describe to the device fails fast).
+        //
+        // The device accepts only the memo-carrying action body, for every
+        // output including the builder's zero-value padding, so the host
+        // needs the full note plaintext of every output. It is recovered
+        // from the PCZT alone: `(recipient, value, rseed)` and the action's
+        // nullifier (rho) determine the note and its ephemeral secret key,
+        // which opens `enc_ciphertext` (no viewing key involved).
 
         // Use low_level_signer to access the parsed orchard::pczt::Bundle(s)
-        // for reading alpha, rk, and action data through public getters. Under
-        // NU6.3 a transaction may carry actions in BOTH the sealed Orchard
-        // pool (turnstile withdrawals) and the Ironwood pool; each bundle is
+        // for reading alpha, rk, and action data through public getters. A
+        // transaction may carry actions in BOTH the sealed Orchard pool
+        // (turnstile withdrawals) and the Ironwood pool; each bundle is
         // collected with its pool tag so the device hashes it into the right
         // ZIP-244 digest tree.
         let mut actions_to_sign: Vec<(ShieldedPoolKind, usize, [u8; 32])> = Vec::new();
@@ -317,16 +289,11 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
         let mut orchard_rk_values: Vec<[u8; 32]> = Vec::new();
         let mut ironwood_rk_values: Vec<[u8; 32]> = Vec::new();
 
-        // Re-parse the PCZT once more for raw access to the per-action output
-        // fields (recipient / value / rseed) that the device needs to recompute
-        // the NoteCommitment. low_level_signer hands us the *typed* orchard
-        // bundle (via the `orchard` crate), which exposes nullifier/rk/cmx but
-        // not the unencrypted output note plaintext; that lives on the PCZT
-        // structure itself.
-        let pczt_for_outputs = pczt::Pczt::parse(&pczt_bytes)
-            .map_err(|e| HwSignerError::SignerInitFailed(format!("PCZT reparse: {:?}", e)))?;
-        let orchard_pczt_actions = pczt_for_outputs.orchard().actions().clone();
-        let ironwood_pczt_actions = pczt_for_outputs.ironwood().actions().clone();
+        // The per-action output fields (recipient / value / rseed) that the
+        // device needs to recompute the NoteCommitment live on the PCZT
+        // structure itself, not on the typed orchard bundle.
+        let orchard_pczt_actions = pczt.orchard().actions().clone();
+        let ironwood_pczt_actions = pczt.ironwood().actions().clone();
 
         /// Collect signing inputs and device-verification data for every
         /// action of one Orchard-protocol bundle (sealed Orchard or Ironwood).
@@ -340,7 +307,6 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             pool: ShieldedPoolKind,
             bundle: &orchard::pczt::Bundle,
             pczt_actions: &[pczt::orchard::Action],
-            ovk_for_recovery: Option<&orchard::keys::OutgoingViewingKey>,
             actions_to_sign: &mut Vec<(ShieldedPoolKind, usize, [u8; 32])>,
             all_actions_data: &mut Vec<ActionData>,
             rk_values: &mut Vec<[u8; 32]>,
@@ -380,51 +346,106 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
 
                 let enc_note = action.output().encrypted_note();
 
-                // Recover the 512-byte memo plaintext by trial-decrypting
-                // out_ciphertext with the sender's OVK, then trial-
-                // decrypting enc_ciphertext with the recovered (esk,
-                // pk_d). Sent to the device alongside the action so it
-                // can recompute enc_ciphertext on-chip and reject any
-                // memo substitution (the cmx defence binds value/recipient
-                // but is silent about memo bytes).
+                // Recover the 512-byte memo plaintext: rebuild the note from
+                // the PCZT's (recipient, value, rseed) and the action's
+                // nullifier (= rho), derive its ephemeral secret key
+                // (a function of rseed and rho), and open enc_ciphertext
+                // with (pk_d, esk). This works for every output the PCZT
+                // describes truthfully — payments, the wallet's own change
+                // and the builder's zero-value padding alike, whatever
+                // outgoing viewing key (if any) the output was built with.
                 //
                 // The note-encryption domain is pool-versioned: Orchard
                 // notes are ZIP-212 V2 plaintexts, Ironwood notes are
-                // ZIP-2005 V3 plaintexts (lead byte 0x03).
-                //
-                // For outputs constructed with OVK::None — explicitly
-                // unrecoverable by the sender — we leave memo as None
-                // and fall back to cmx-only verification for that
-                // action. esk is not transmitted: it is a function of
-                // (rseed, rho) and the device re-derives it on-chip.
-                let memo: Option<[u8; 512]> = ovk_for_recovery.and_then(|ovk| {
-                    use ::zcash_note_encryption::try_output_recovery_with_ovk;
+                // ZIP-2005 V3 plaintexts (lead byte 0x03). esk is not
+                // transmitted: the device re-derives it the same way.
+                let pool_name = match pool {
+                    ShieldedPoolKind::Orchard => "Orchard",
+                    ShieldedPoolKind::Ironwood => "Ironwood",
+                };
+                let not_recoverable = |reason: &str| HwSignerError::OutputNotRecoverable {
+                    pool: pool_name,
+                    action_idx: i,
+                    value,
+                    reason: reason.to_string(),
+                };
+                let memo: [u8; 512] = {
+                    use ::zcash_note_encryption::{try_output_recovery_with_pkd_esk, Domain};
+                    use orchard::note::{NoteVersion, RandomSeed, Rho};
                     use orchard::note_encryption::{IronwoodDomain, OrchardDomain};
-                    match pool {
-                        ShieldedPoolKind::Orchard => {
-                            let domain = OrchardDomain::for_pczt_action(action);
-                            try_output_recovery_with_ovk(
-                                &domain,
-                                ovk,
-                                action,
-                                action.cv_net(),
-                                &enc_note.out_ciphertext,
-                            )
-                            .map(|(_note, _addr, memo)| memo)
-                        }
-                        ShieldedPoolKind::Ironwood => {
-                            let domain = IronwoodDomain::for_pczt_action(action);
-                            try_output_recovery_with_ovk(
-                                &domain,
-                                ovk,
-                                action,
-                                action.cv_net(),
-                                &enc_note.out_ciphertext,
-                            )
-                            .map(|(_note, _addr, memo)| memo)
+
+                    let address = Option::<orchard::Address>::from(
+                        orchard::Address::from_raw_address_bytes(&recipient),
+                    )
+                    .ok_or_else(|| not_recoverable("the PCZT recipient is not a valid Orchard address"))?;
+                    let rho = Option::<Rho>::from(Rho::from_bytes(
+                        &action.spend().nullifier().to_bytes(),
+                    ))
+                    .ok_or_else(|| not_recoverable("the action nullifier is not a valid rho"))?;
+                    let random_seed =
+                        Option::<RandomSeed>::from(RandomSeed::from_bytes(rseed, &rho))
+                            .ok_or_else(|| not_recoverable("the PCZT rseed is not valid for this action"))?;
+                    let version = match pool {
+                        ShieldedPoolKind::Orchard => NoteVersion::V2,
+                        ShieldedPoolKind::Ironwood => NoteVersion::V3,
+                    };
+                    let note = Option::<orchard::Note>::from(orchard::Note::from_parts(
+                        address,
+                        orchard::value::NoteValue::from_raw(value),
+                        rho,
+                        random_seed,
+                        version,
+                    ))
+                    .ok_or_else(|| not_recoverable("the PCZT note fields do not form a valid note"))?;
+
+                    let recovered = match pool {
+                        ShieldedPoolKind::Orchard => OrchardDomain::derive_esk(&note)
+                            .and_then(|esk| {
+                                try_output_recovery_with_pkd_esk(
+                                    &OrchardDomain::for_pczt_action(action),
+                                    OrchardDomain::get_pk_d(&note),
+                                    esk,
+                                    action,
+                                )
+                            })
+                            .map(|(_note, _addr, memo)| memo),
+                        ShieldedPoolKind::Ironwood => IronwoodDomain::derive_esk(&note)
+                            .and_then(|esk| {
+                                try_output_recovery_with_pkd_esk(
+                                    &IronwoodDomain::for_pczt_action(action),
+                                    IronwoodDomain::get_pk_d(&note),
+                                    esk,
+                                    action,
+                                )
+                            })
+                            .map(|(_note, _addr, memo)| memo),
+                    };
+                    match recovered {
+                        Some(memo) => memo,
+                        // One output cannot be opened by design: in the
+                        // sealed Orchard pool (cross-address transfers
+                        // disabled) the builder pairs each real spend with a
+                        // zero-value output to the spent note's own
+                        // receiver and, for an external-scope spend,
+                        // replaces its enc_ciphertext with random bytes
+                        // (orchard::builder, `fabricated_for_spend`). It
+                        // still goes out with the full body, declaring the
+                        // memo the builder used — 512 zero bytes. The DEVICE
+                        // decides whether to tolerate it: only for a
+                        // zero-value sealed-Orchard output to one of its own
+                        // addresses, with the expected epk and no memo.
+                        None if pool == ShieldedPoolKind::Orchard && value == 0 => [0u8; 512],
+                        // Any other output that does not open — any value
+                        // in Ironwood, any non-zero value — cannot be
+                        // described to the device.
+                        None => {
+                            return Err(not_recoverable(
+                                "enc_ciphertext does not decrypt with the note the PCZT describes \
+                                 (recipient / value / rseed)",
+                            ))
                         }
                     }
-                });
+                };
 
                 all_actions_data.push(ActionData {
                     pool,
@@ -433,25 +454,24 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                     rk: <[u8; 32]>::from(action.spend().rk().clone()),
                     cmx: action.output().cmx().to_bytes(),
                     ephemeral_key: enc_note.epk_bytes,
-                    enc_ciphertext: enc_note.enc_ciphertext.to_vec(),
+                    enc_ciphertext: enc_note.enc_ciphertext.0.to_vec(),
                     out_ciphertext: enc_note.out_ciphertext.to_vec(),
                     recipient,
                     value,
                     rseed,
-                    memo,
+                    memo: Some(memo),
                 });
             }
             Ok(())
         }
 
-        let temp_signer = pczt::roles::low_level_signer::Signer::new(pre_pczt);
+        let temp_signer = pczt::roles::low_level_signer::Signer::new(pczt.clone());
         let temp_signer = temp_signer
             .sign_orchard_with(|_pczt, bundle, _tx_modifiable| -> std::result::Result<(), HwSignerError> {
                 collect_pool_actions(
                     ShieldedPoolKind::Orchard,
                     bundle,
                     &orchard_pczt_actions,
-                    ovk_for_recovery.as_ref(),
                     &mut actions_to_sign,
                     &mut all_actions_data,
                     &mut orchard_rk_values,
@@ -463,7 +483,6 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
                     ShieldedPoolKind::Ironwood,
                     bundle,
                     &ironwood_pczt_actions,
-                    ovk_for_recovery.as_ref(),
                     &mut actions_to_sign,
                     &mut all_actions_data,
                     &mut ironwood_rk_values,
@@ -480,51 +499,64 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             actions_to_sign.len()
         );
 
-        // Step 5: Collect transparent inputs/outputs up-front so we can hand
-        // the FULL tx (meta + transparent + Orchard + sighash sentinel) to the
-        // device in a single, correctly-ordered verification pass.
-        //
-        // The device's signer state machine refuses to accept the transparent
-        // stream after the shielded sighash sentinel has flipped it to
-        // VERIFIED, and conversely refuses to advance to VERIFIED if
-        // `transparent_sig_digest` is non-empty and the transparent flow was
-        // skipped. So both pieces have to be sent in one ordered batch — see
-        // `HardwareSigner::verify_transaction` for the wire-order contract.
-        let (t_inputs, t_outputs) = {
-            let t_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| {
-                HwSignerError::SignerInitFailed(format!(
-                    "PCZT reparse for transparent: {:?}",
-                    e
-                ))
-            })?;
-            let inputs: Vec<TransparentInputData> = t_pczt
-                .transparent()
-                .inputs()
-                .iter()
-                .map(|inp| TransparentInputData {
-                    prevout_hash: *inp.prevout_txid(),
-                    prevout_index: *inp.prevout_index(),
-                    sequence: inp.sequence().unwrap_or(0xFFFFFFFF),
-                    value: *inp.value(),
-                    script_pubkey: inp.script_pubkey().clone(),
-                })
-                .collect();
-            let outputs: Vec<TransparentOutputData> = t_pczt
-                .transparent()
-                .outputs()
-                .iter()
-                .map(|out| TransparentOutputData {
-                    value: *out.value(),
-                    script_pubkey: out.script_pubkey().clone(),
-                })
-                .collect();
-            (inputs, outputs)
-        };
-        let has_transparent = !t_inputs.is_empty();
-        if has_transparent {
+        // Step 4: Generate the Halo2 proof(s).
+        info!("Running Orchard-protocol prover...");
+
+        // v6-only: NU6.3 or NU7 is
+        // guaranteed by the check above (both select Orchard protocol
+        // revision V3), so both the sealed Orchard pool and the
+        // Ironwood pool use the post-NU6.3 circuit (the one that enforces
+        // the cross-address restriction public input) — one proving key
+        // serves both bundles.
+        use orchard::circuit::OrchardCircuitVersion;
+
+        let mut prover = pczt::roles::prover::Prover::new(pczt.clone());
+        let need_orchard_proof = prover.requires_orchard_proof();
+        let need_ironwood_proof = prover.requires_ironwood_proof();
+        if need_orchard_proof || need_ironwood_proof {
+            let pk = orchard::circuit::ProvingKey::build(OrchardCircuitVersion::PostNu6_3);
+            // pczt 0.10: the Prover role no longer draws OS randomness
+            // itself; hand it the platform CSPRNG (the previous behaviour).
+            let mut rng = rand_core::UnwrapErr(rand::rngs::SysRng);
+            if need_orchard_proof {
+                prover = prover
+                    .create_orchard_proof(&mut rng, &pk)
+                    .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
+            }
+            if need_ironwood_proof {
+                prover = prover
+                    .create_ironwood_proof(&mut rng, &pk)
+                    .map_err(|e| HwSignerError::ProofFailed(format!("{:?}", e)))?;
+            }
+        }
+        let proven_pczt = prover.finish();
+
+        info!("Orchard proof generated. Initializing signer...");
+
+        // Step 5: Initialize Signer role and extract sighash
+        let mut signer_role = pczt::roles::signer::Signer::new(proven_pczt)
+            .map_err(|e| HwSignerError::SignerInitFailed(format!("{:?}", e)))?;
+
+        let mut sighash = signer_role.shielded_sighash();
+        info!("Sighash: {}...", hex::encode(&sighash[..8]));
+
+
+        // Step 6: Collect the transparent outputs (a shielded -> t-address
+        // send) so the device can recompute the transparent digest and show
+        // each one. There are no transparent inputs (refused above).
+        let t_inputs: Vec<TransparentInputData> = Vec::new();
+        let t_outputs: Vec<TransparentOutputData> = pczt
+            .transparent()
+            .outputs()
+            .iter()
+            .map(|out| TransparentOutputData {
+                value: *out.value(),
+                script_pubkey: out.script_pubkey().clone(),
+            })
+            .collect();
+        if !t_outputs.is_empty() {
             info!(
-                "{} transparent input(s), {} output(s) — verification will include transparent digest",
-                t_inputs.len(),
+                "{} transparent output(s) — verification will include the transparent digest",
                 t_outputs.len()
             );
         }
@@ -566,9 +598,13 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
 
             // Verify rk and signature against the pool the action belongs to
             let pczt_rk = match pool {
-                ShieldedPoolKind::Orchard => orchard_rk_values[*action_idx],
-                ShieldedPoolKind::Ironwood => ironwood_rk_values[*action_idx],
-            };
+                ShieldedPoolKind::Orchard => orchard_rk_values.get(*action_idx),
+                ShieldedPoolKind::Ironwood => ironwood_rk_values.get(*action_idx),
+            }
+            .copied()
+            .ok_or_else(|| {
+                HwSignerError::InvalidPczt(format!("{:?} action {} has no rk", pool, action_idx))
+            })?;
             verify::verify_signature(&response, &sighash, &pczt_rk, *action_idx)?;
 
             // Apply the signature to the PCZT via the upstream Signer API
@@ -590,86 +626,9 @@ impl<S: HardwareSigner> PcztHardwareSigning<S> {
             actions_signed += 1;
         }
 
-        // Step 8: Transparent signing — the device already verified the
-        // transparent digest as part of step 5b's `verify_transaction` call,
-        // so it is in VERIFIED state with `transparent_verified = true`. We
-        // only have to drive the per-input ECDSA signing requests now.
-        let mut transparent_inputs_signed = 0usize;
-        if has_transparent {
-            let t_pczt = pczt::Pczt::parse(&pczt_bytes).map_err(|e| {
-                HwSignerError::SignerInitFailed(format!(
-                    "PCZT reparse for transparent: {:?}",
-                    e
-                ))
-            })?;
-            let pczt_t_inputs = t_pczt.transparent().inputs();
-
-            for (i, t_input_data) in t_inputs.iter().enumerate() {
-                // Per-input sighash comes from the pczt signer (ZIP-244 S.2)
-                let t_sighash = signer_role.transparent_sighash(i).map_err(|e| {
-                    HwSignerError::SignerInitFailed(format!(
-                        "transparent_sighash({}) failed: {:?}",
-                        i, e
-                    ))
-                })?;
-
-                let request = TransparentSignRequest {
-                    sighash: t_sighash,
-                    input_index: i,
-                    total_inputs: pczt_t_inputs.len(),
-                    value: *pczt_t_inputs[i].value(),
-                    script_pubkey: pczt_t_inputs[i].script_pubkey().clone(),
-                };
-
-                let response = self.signer.sign_transparent_input(&request, t_input_data)?;
-
-                // The DER signature carries a trailing sighash_type byte
-                // (Bitcoin convention); strip it before parsing the
-                // ECDSA structure for both verification and PCZT injection.
-                let der_sig_bytes =
-                    &response.signature[..response.signature.len().saturating_sub(1)];
-
-                // Defence-in-depth host re-verification of the ECDSA
-                // signature against the host-computed sighash and the
-                // device-returned pubkey, plus a HASH160 cross-check tying
-                // that pubkey to the input's P2PKH script_pubkey. Mirrors
-                // the Orchard verify pattern; closes the gap where a buggy
-                // or hostile device could return a valid-DER but
-                // cryptographically wrong signature, or sign with the wrong
-                // key. Audit: docs/security-audit/04-host-sdk-rust.md H2.
-                crate::verify::verify_transparent_signature(
-                    &t_sighash,
-                    der_sig_bytes,
-                    &response.pubkey,
-                    &request.script_pubkey,
-                    i,
-                )?;
-
-                let ecdsa_sig = secp256k1::ecdsa::Signature::from_der(der_sig_bytes).map_err(
-                    |e| HwSignerError::TransparentSignatureVerificationFailed {
-                        input_idx: i,
-                        reason: format!("Invalid DER signature: {}", e),
-                    },
-                )?;
-
-                signer_role
-                    .append_transparent_signature(i, ecdsa_sig)
-                    .map_err(|e| {
-                        HwSignerError::SignerInitFailed(format!(
-                            "Failed to apply transparent signature for input {}: {:?}",
-                            i, e
-                        ))
-                    })?;
-
-                debug!("transparent input[{}]: signed and applied OK", i);
-                transparent_inputs_signed += 1;
-            }
-
-            info!(
-                "{} transparent input(s) signed by hardware",
-                transparent_inputs_signed
-            );
-        }
+        // (No transparent signing step: PCZTs with transparent inputs are
+        // refused at the top of this function.)
+        let transparent_inputs_signed = 0usize;
 
         // Step 9: Finalize and return signed PCZT
         sighash.zeroize();
